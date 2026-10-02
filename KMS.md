@@ -33,18 +33,32 @@ These were ruled out:
 
 ## Issues found
 
-### 1. The vc4 driver powers V3D off when it is idle
+### 1. V3D power management depends on the kernel version
 
-The `vc4` driver uses runtime PM for V3D, with a 40 ms autosuspend delay (`vc4_v3d.c`). When no DRM client
-is using the GPU, for example with no desktop running, V3D is clock-gated
-(`vc4_v3d_runtime_suspend()` → `clk_disable_unprepare()`). VC4CL knows nothing about this and writes
-registers of a block that may be off. A powered-off V3D returns `0xdeadbeef` for every register read.
+The `vc4` driver uses runtime PM for V3D, with a 40 ms autosuspend delay. When the device suspends, its
+clock is gated (`vc4_v3d_runtime_suspend()`), and the firmware `V3D` power domain is switched off
+(`raspberrypi-power.c`, `RPI_FIRMWARE_SET_DOMAIN_STATE`). A powered-off V3D returns `0xdeadbeef` for
+every register read.
 
-Whether V3D happens to be powered at launch time depends on what else is running. That explains why a
-hang can hit the very first kernel.
+What actually happens depends on the kernel:
 
-Workaround without the patch: `echo on | sudo tee /sys/bus/platform/devices/3fc00000.v3d/power/control`.
-This setting resets to `auto` on every boot.
+- **Raspberry Pi kernel 6.6 (`rpi-6.6.y`, for example `6.6.31+rpt-rpi-v8`): V3D never suspends.**
+  `vc4_v3d_bind()` takes a reference with `pm_runtime_resume_and_get()` and drops it only on the error
+  path. On success it keeps it forever. On a live system, `power/runtime_suspended_time` stays at 0, even
+  headless.
+
+  A side effect is that the driver's GPU reset does nothing. `vc4_reset()` drops its own reference
+  with `pm_runtime_put_sync_suspend()`, but the bind reference keeps V3D powered. So no hang, from GL
+  or from VC4CL, ever really power-cycles the GPU.
+- **Mainline and `rpi-6.12.y`:** `vc4_v3d_bind()` ends with `pm_runtime_put_autosuspend(dev)`. V3D
+  suspends 40 ms after the last DRM job, and `vc4_reset()` really power-cycles it. With this kernel,
+  VC4CL must keep V3D powered itself, or it pokes registers of a block that is off. That's what the
+  power part of the patch does. Without the patch, the same effect comes from
+  `echo on | sudo tee /sys/bus/platform/devices/3fc00000.v3d/power/control`, which resets to `auto` on
+  every boot.
+
+So on 6.6 this issue isn't what caused the hangs: V3D was always powered. The fixes that made headless
+clpeak work are among issues 2–4.
 
 ### 2. The vc4 driver reserves no VPM memory for user programs
 
@@ -103,7 +117,7 @@ issue 4.
 |---|---|
 | 1 | `V3D` sets `power/control` to `on` on construction and waits for `runtime_status` to be `active`. The original value is restored on destruction. Before each launch, it re-checks power and that `V3D_IDENT0` reads `"V3D"`, and refuses to launch otherwise. |
 | 2 | Before each launch, sets `VPMBASE` to 16 (16 × 256 B = 4 KB, the most VC4C uses) if it is lower. |
-| 3 | On a timeout, the GPU is marked hung. VC4CL then tries to reset V3D the same way the `vc4` driver does in `vc4_reset()`: it sets `power/control` to `auto`, waits for `runtime_status` to become `suspended` (V3D is in the firmware `V3D` power domain, so suspending powers it off), then powers V3D back on. If that works, VC4CL continues normally. If not, VC4CL stays in the hung state: later launches fail immediately and `SystemAccess::deallocateBuffer()` leaks buffers instead of freeing them. **See "Timeout recovery" below: with the desktop running, the reset does not work.** |
+| 3 | On a timeout, the GPU is marked hung, and VC4CL resets V3D by power-cycling its power domain through the firmware (`V3D::resetByPowerCycle()`, see "Resetting V3D through the firmware" below). The reset only counts as successful if the user-program counters in `SRQCS` read 0 afterwards. Then VC4CL continues normally, and later kernels in the same process work. Otherwise, VC4CL stays in the hung state: later launches fail immediately and `SystemAccess::deallocateBuffer()` leaks buffers instead of freeing them. The `v3d_reset` tool runs the same reset by hand. |
 | 4 | `v3dBasePointer` is `volatile`, and a `dsb sy` is issued before the QPUs are started. |
 
 ## Results
@@ -112,7 +126,7 @@ Headless (`lightdm` stopped), with the patches installed, `clpeak` runs to the e
 kernel log has no `WARNING`, `Oops`, `Bad page map` or `vmalloc error` entries. Without the patches, the
 same setup hung and corrupted kernel memory.
 
-## Timeout recovery (tested with the desktop running)
+## First attempt: timeout recovery through runtime PM (kernel 6.6)
 
 Test: a kernel that spins forever and only reads memory. Results:
 
@@ -128,10 +142,76 @@ Test: a kernel that spins forever and only reads memory. Results:
 - The firmware mailbox tag `SET_ENABLE_QPU` (0x30012) was acknowledged but had no effect.
 - Only a reboot clears the QPUs.
 
-Conclusion: with a GL client running, a QPU user program that never terminates can't be stopped from
-userspace. The `vc4` driver's own reset can't stop it either, so GL stays wedged until reboot. Treat any
-kernel timeout as needing a reboot unless the system is headless and the reset log says
-`V3D was reset by power-cycling it`.
+Cause: this was kernel 6.6, where V3D never runtime-suspends at all (see issue 1). It has nothing to do
+with the desktop. Neither VC4CL's reset nor `vc4_reset()` could power-cycle V3D. On 6.12, both resets
+should actually power V3D off (not yet tested).
+
+Conclusion: on kernel 6.6, runtime PM can't stop a QPU program that never terminates, and neither can
+the `vc4` driver's own reset. The firmware reset below can, and VC4CL now uses it instead.
+
+## Resetting V3D through the firmware (works on kernel 6.6)
+
+Bypassing Linux runtime PM, you can ask the firmware directly to switch the V3D power domain off and on
+again. Use the same mailbox call the kernel's `raspberrypi-power` driver makes:
+
+- tag `RPI_FIRMWARE_SET_DOMAIN_STATE` (`0x00038030`), payload `{domain, on}`;
+- `RPI_FIRMWARE_GET_DOMAIN_STATE` (`0x00030030`) reads the state back.
+
+**The firmware domain number is the DT binding index plus one** (`rpi_init_power_domain()`: "The DT
+binding index is the firmware's domain index minus one"). So V3D is firmware domain **11**
+(`RPI_POWER_DOMAIN_V3D` is 10), and firmware domain 10 is H264. The firmware keeps a reference count
+per domain, and Linux holds the single reference on V3D. So "off" drops Linux's reference, which powers
+the domain down, and "on" takes it back.
+
+Tested on `6.6.31+rpt-rpi-v8`, headless, with 12 QPUs spinning in a never-ending kernel
+(`SRQCS`: 12 requests, 0 completed):
+
+| | `SRQCS` (requests/completed) | `INTENA` | `VPMBASE` |
+|---|---|---|---|
+| before | 12 / 0 | 0x3 | 16 |
+| after firmware off → on | **0 / 0** | 0 | 0 |
+
+Every register was back at its hardware default, which proves a real power cycle, not a clock freeze.
+The QPU programs were gone. The test was repeated twice. After restoring the registers, the vector-add
+demo ran correctly every time (five runs). Only the first run after the first reset hung, and it was
+killed after 90 s. Its output was lost to pipe buffering, so it's unexplained, and it didn't reproduce
+when the cycle was repeated.
+
+The `vc4` driver doesn't notice this power cycle. So afterwards, whoever reset V3D must restore what
+the driver configured, the same things the driver itself redoes after a runtime resume:
+
+- `INTENA`: the driver's interrupt enables, write-1-to-set. Without them, GL jobs never complete.
+- `VPMBASE`.
+- `BPOA` and `BPOS`: binner overflow memory, if any had been handed out.
+
+VC4CL does this in `V3D::resetByPowerCycle()`:
+
+1. Refuse unless the `vc4` driver owns V3D, V3D is powered, and the firmware reports the domain as on.
+   On the firmware stack, Linux holds no reference that it could drop.
+2. Save `INTENA`, `VPMBASE`, `BPOA` and `BPOS`.
+3. Switch the domain off. If that fails, stop there, since switching it on would add a second
+   reference. Then wait 50 ms and switch it on. Don't touch any V3D register while it's off: accessing
+   the isolated block might hang the bus.
+4. Wait for `V3D_IDENT0` to read `"V3D"` again, then restore the saved registers.
+5. Count the reset as successful only if the request, completed and queue counters in `SRQCS` are all
+   0. A clock freeze would leave them unchanged.
+
+It's called automatically on a kernel timeout. The `v3d_reset` tool (`tools/V3DReset.cpp`, installed
+as `/usr/local/bin/v3d_reset`) calls it by hand. `v3d_reset --status` only shows the counters.
+
+Tested headless on 6.6:
+
+- A process runs a never-ending kernel and then a second kernel. The first kernel times out after 30 s
+  (`CL_OUT_OF_RESOURCES`), VC4CL logs `V3D was reset by power-cycling it`, and the second kernel runs
+  with correct results.
+- With QPUs left spinning by an older VC4CL build, `v3d_reset` takes the counters from `12/0/0` to
+  `0/0/0`. The demo runs correctly afterwards.
+
+In both cases, the firmware domains afterwards are as at boot (V3D 1, H264 0), and the kernel log is
+clean.
+
+Not tested yet: a reset while a GL job is running. That job's state would be lost, and the `vc4`
+driver would have to recover through its hangcheck.
 
 ## Remaining limitations
 
@@ -154,7 +234,8 @@ Do the work the patches fake inside the `vc4` kernel driver: a privileged ioctl 
 - queue the job with bin/render jobs so it never overlaps them;
 - write the `SRQ*` registers;
 - signal completion through the normal seqno and fence path;
-- reset the GPU through `vc4_reset()` on a hang.
+- reset the GPU on a hang: through `vc4_reset()` on kernels that have the runtime-PM fix (6.12+), or
+  through the firmware power cycle above on 6.6, where `vc4_reset()` doesn't power-cycle anything.
 
 VC4CL would get a `DRM` backend in `src/hal/` that allocates through `DRM_IOCTL_VC4_CREATE_BO` and submits
 through the new ioctl. That works with the desktop running, needs neither `/dev/mem` nor `gpu_mem`, and
@@ -166,4 +247,6 @@ memory comes from CMA.
 sudo systemctl stop lightdm          # headless: nothing else using V3D
 sudo VC4CL_DEBUG=system ./a.out      # should log "V3D is managed by the vc4 DRM driver"
 sudo clpeak --compute-sp             # check `sudo dmesg` afterwards for WARNING/Oops/Bad page map
+sudo v3d_reset --status              # QPU user programs: requests/completed/in queue
+sudo v3d_reset                       # if QPUs are left running (completed < requests), reset V3D
 ```

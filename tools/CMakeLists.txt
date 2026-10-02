@@ -3,6 +3,11 @@ target_link_libraries(v3d_info VC4CL ${SYSROOT_LIBRARY_FLAGS})
 target_include_directories(v3d_info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
 target_compile_options(v3d_info PRIVATE ${VC4CL_ENABLED_WARNINGS})
 
+add_executable(v3d_reset "")
+target_link_libraries(v3d_reset VC4CL ${SYSROOT_LIBRARY_FLAGS})
+target_include_directories(v3d_reset PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+target_compile_options(v3d_reset PRIVATE ${VC4CL_ENABLED_WARNINGS})
+
 if(CURSES_FOUND)
   add_executable(v3d_profile "")
   target_link_libraries(v3d_profile VC4CL ${SYSROOT_LIBRARY_FLAGS})
@@ -22,6 +27,7 @@ endif()
 
 if(BUILD_ICD)
   target_compile_definitions(v3d_info PRIVATE -Dcl_khr_icd=1 -Duse_cl_khr_icd=1)
+  target_compile_definitions(v3d_reset PRIVATE -Dcl_khr_icd=1 -Duse_cl_khr_icd=1)
   if(CURSES_FOUND)
     target_compile_definitions(v3d_profile PRIVATE -Dcl_khr_icd=1 -Duse_cl_khr_icd=1)
   endif()
@@ -40,6 +46,7 @@ include(sources.list)
 ##
 # Creates the install target for the library and the tools
 install(TARGETS v3d_info EXPORT v3d_info-targets RUNTIME DESTINATION bin)
+install(TARGETS v3d_reset EXPORT v3d_reset-targets RUNTIME DESTINATION bin)
 if(CURSES_FOUND)
   install(TARGETS v3d_profile EXPORT v3d_profile-targets RUNTIME DESTINATION bin)
 endif()

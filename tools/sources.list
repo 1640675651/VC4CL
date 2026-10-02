@@ -4,6 +4,12 @@ target_sources(v3d_info
     V3DInfo.cpp
 )
 
+target_sources(v3d_reset
+  PRIVATE
+    common.h
+    V3DReset.cpp
+)
+
 if(CURSES_FOUND)
   target_sources(v3d_profile
     PRIVATE

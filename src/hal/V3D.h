@@ -234,6 +234,16 @@ namespace vc4cl
             return hung;
         }
 
+        /*
+         * Resets V3D by power-cycling its power domain via the firmware, which also stops all running QPU programs.
+         *
+         * Only supported if V3D is managed by the vc4 DRM driver (KMS). Anything currently running on V3D (including
+         * jobs of other programs) is aborted.
+         *
+         * Returns whether V3D was verified to be reset.
+         */
+        CHECK_RETURN bool resetByPowerCycle();
+
     private:
         volatile uint32_t* v3dBasePointer;
 

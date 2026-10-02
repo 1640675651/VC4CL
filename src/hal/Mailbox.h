@@ -128,6 +128,10 @@ namespace vc4cl
         GET_POWER_STATE = 0x00020001,
         TIMING = 0x00020002,
         SET_POWER_STATE = 0x00028001,
+        // power domains, as used by the Linux raspberrypi-power driver. The firmware domain index is the Linux DT
+        // binding index (RPI_POWER_DOMAIN_xxx) + 1. The firmware reference-counts the domain states.
+        GET_DOMAIN_STATE = 0x00030030,
+        SET_DOMAIN_STATE = 0x00038030,
         GET_CLOCK_STATE = 0x00030001,
         SET_CLOCK_STATE = 0x00038001,
         GET_CLOCK_RATE = 0x00030002,

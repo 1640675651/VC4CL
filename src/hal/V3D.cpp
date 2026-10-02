@@ -6,6 +6,7 @@
 
 #include "V3D.h"
 
+#include "Mailbox.h"
 #include "hal.h"
 #include "userland.h"
 
@@ -16,6 +17,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <system_error>
 #include <thread>
@@ -30,6 +32,10 @@ static constexpr uint32_t V3D_IDENT0 = 0x0000 / sizeof(uint32_t);
 static constexpr uint32_t V3D_IDENT1 = 0x0004 / sizeof(uint32_t);
 static constexpr uint32_t V3D_L2CACTL = 0x00020 / sizeof(uint32_t);
 static constexpr uint32_t V3D_SLCACTL = 0x00024 / sizeof(uint32_t);
+static constexpr uint32_t V3D_INTENA = 0x00034 / sizeof(uint32_t);
+static constexpr uint32_t V3D_INTDIS = 0x00038 / sizeof(uint32_t);
+static constexpr uint32_t V3D_BPOA = 0x00308 / sizeof(uint32_t);
+static constexpr uint32_t V3D_BPOS = 0x0030c / sizeof(uint32_t);
 // constexpr uint32_t V3D_IDENT2 = 0x0008 / sizeof(uint32_t);
 static constexpr uint32_t V3D_QPU_RESERVATIONS0 = 0x0410 / sizeof(uint32_t);
 // constexpr uint32_t V3D_QPU_RESERVATIONS1 = 0x0414 / sizeof(uint32_t);
@@ -53,8 +59,11 @@ static constexpr uint32_t V3D_IDENT0_MAGIC = 0x443356;
 static constexpr uint32_t VPM_USER_RESERVATION = 16;
 
 static constexpr std::chrono::milliseconds POWER_ON_TIMEOUT{1000};
-// Needs to be longer than the runtime PM autosuspend delay (40ms for vc4)
-static constexpr std::chrono::milliseconds POWER_OFF_TIMEOUT{2000};
+
+// The firmware index of the V3D power domain: The Linux DT binding index RPI_POWER_DOMAIN_V3D (10) + 1, see
+// rpi_init_power_domain() in the Linux raspberrypi-power driver
+static constexpr unsigned FIRMWARE_V3D_POWER_DOMAIN = 11;
+static constexpr std::chrono::milliseconds POWER_DOMAIN_OFF_TIME{50};
 
 /*
  * If V3D is managed by the Linux vc4 DRM driver (the KMS graphics stack), returns the runtime PM sysfs directory of the
@@ -103,6 +112,36 @@ static bool waitForRuntimeStatus(
         std::this_thread::sleep_for(std::chrono::milliseconds{5});
     }
     return true;
+}
+
+/*
+ * Sends a property message to the firmware.
+ *
+ * NOTE: Not using the Mailbox class, since creating an instance of it changes the QPU enable state.
+ */
+static bool firmwareCall(void* buffer)
+{
+    int fd = open("/dev/vcio", 0);
+    if(fd < 0)
+        return false;
+    int status = ioctl(fd, _IOWR(100, 0, char*), buffer);
+    close(fd);
+    return status >= 0;
+}
+
+static bool getV3DPowerDomainState(bool& isOn)
+{
+    MailboxMessage<MailboxTag::GET_DOMAIN_STATE, 2, 2> msg({FIRMWARE_V3D_POWER_DOMAIN, 0});
+    if(!firmwareCall(msg.buffer.data()) || !msg.isSuccessful())
+        return false;
+    isOn = msg.getContent(1) != 0;
+    return true;
+}
+
+static bool setV3DPowerDomainState(bool on)
+{
+    MailboxMessage<MailboxTag::SET_DOMAIN_STATE, 2, 2> msg({FIRMWARE_V3D_POWER_DOMAIN, on ? 1u : 0u});
+    return firmwareCall(msg.buffer.data()) && msg.isSuccessful();
 }
 
 static inline void memoryBarrier()
@@ -177,30 +216,82 @@ void V3D::recoverFromTimeout()
     // stopped, do not execute anything else and do not free any memory they could access.
     hung = true;
     std::cout << "[VC4CL] Kernel execution timed out, the QPUs might still be running!" << std::endl;
-    if(pmDirectory.empty())
-    {
-        std::cout << "[VC4CL] Cannot reset V3D, no more kernels will be executed and GPU memory will not be freed"
-                  << std::endl;
-        return;
-    }
-
-    // Reset V3D the same way the vc4 DRM driver does (see vc4_reset()): Let it runtime suspend, which powers it off,
-    // then power it on again. Runtime suspend only happens if no DRM client is using V3D at the moment.
-    bool suspended = writeSysfs(pmDirectory + "control", "auto") &&
-        waitForRuntimeStatus(pmDirectory, "suspended", POWER_OFF_TIMEOUT);
-    // the temporary "auto" is not the value to restore on exit
-    auto savedPmControl = originalPmControl;
-    bool resumed = ensurePoweredOn();
-    originalPmControl = savedPmControl;
-    if(suspended && resumed)
+    if(resetByPowerCycle())
     {
         hung = false;
         std::cout << "[VC4CL] V3D was reset by power-cycling it" << std::endl;
     }
     else
-        std::cout << "[VC4CL] Failed to reset V3D (is another program using the GPU?), no more kernels will be "
-                     "executed and GPU memory will not be freed"
+        std::cout << "[VC4CL] Failed to reset V3D, no more kernels will be executed and GPU memory will not be freed"
                   << std::endl;
+}
+
+bool V3D::resetByPowerCycle()
+{
+    // On the firmware graphics stack, the firmware itself holds the reference on the V3D power domain, which we
+    // cannot drop
+    if(pmDirectory.empty())
+    {
+        std::cout << "[VC4CL] Resetting V3D is only supported if it is managed by the vc4 DRM driver" << std::endl;
+        return false;
+    }
+    bool isDomainOn = false;
+    if(!isPoweredOn() || !getV3DPowerDomainState(isDomainOn) || !isDomainOn)
+    {
+        std::cout << "[VC4CL] V3D power domain is not on, cannot reset V3D" << std::endl;
+        return false;
+    }
+
+    // The vc4 DRM driver does not know about this power cycle, so we need to restore what it set up, like it does
+    // itself on runtime resume (vc4_v3d_init_hw(), vc4_irq_enable()) and when handing out binner overflow memory.
+    const uint32_t interruptsEnabled = v3dBasePointer[V3D_INTENA];
+    const uint32_t vpmBase = v3dBasePointer[V3D_VPMBASE];
+    const uint32_t binnerOverflowAddress = v3dBasePointer[V3D_BPOA];
+    const uint32_t binnerOverflowSize = v3dBasePointer[V3D_BPOS];
+
+    // Linux holds the only reference on the power domain, dropping it powers off V3D. Do not access any V3D register
+    // while it is off, since accesses through the isolated bus bridge might hang the bus.
+    if(!setV3DPowerDomainState(false))
+    {
+        // the domain is still on, so do not take another reference by powering it on
+        std::cout << "[VC4CL] Failed to power off the V3D power domain" << std::endl;
+        return false;
+    }
+    std::this_thread::sleep_for(POWER_DOMAIN_OFF_TIME);
+    if(!setV3DPowerDomainState(true))
+    {
+        std::cout << "[VC4CL] Failed to power on the V3D power domain again, V3D is unusable until reboot!"
+                  << std::endl;
+        return false;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    while(!isPoweredOn())
+    {
+        if(std::chrono::steady_clock::now() - start > POWER_ON_TIMEOUT)
+        {
+            std::cout << "[VC4CL] V3D did not come back after powering it on again" << std::endl;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{1});
+    }
+
+    // INTENA is write-1-to-enable, INTDIS write-1-to-disable
+    v3dBasePointer[V3D_INTDIS] = ~interruptsEnabled;
+    v3dBasePointer[V3D_INTENA] = interruptsEnabled;
+    v3dBasePointer[V3D_VPMBASE] = vpmBase;
+    v3dBasePointer[V3D_BPOA] = binnerOverflowAddress;
+    v3dBasePointer[V3D_BPOS] = binnerOverflowSize;
+
+    // A real power cycle resets the user program request, completion and queue counters. If V3D was only clock-gated,
+    // the QPU programs would still be there (and continue running).
+    const uint32_t programStatus = v3dBasePointer[V3D_SRQCS];
+    if((programStatus & 0x00FFFF3F) != 0)
+    {
+        std::cout << "[VC4CL] V3D was not reset by the power cycle, user program status: 0x" << std::hex
+                  << programStatus << std::dec << std::endl;
+        return false;
+    }
+    return true;
 }
 
 uint32_t V3D::getSystemInfo(const SystemInfo key) const
