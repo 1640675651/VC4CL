@@ -226,6 +226,8 @@ driver would have to recover through its hangcheck.
 
 ## The proper fix
 
+Design and first implementation: [DRM-DESIGN.md](DRM-DESIGN.md).
+
 Do the work the patches fake inside the `vc4` kernel driver: a privileged ioctl (gated on
 `CAP_SYS_RAWIO`, since there is no MMU) that runs a list of QPU user programs. The driver would then:
 
