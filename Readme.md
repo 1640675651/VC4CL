@@ -63,6 +63,8 @@ This means, an OpenCL kernel could be used to read sensitive data or write into 
 Depending on the configuration used for the VC4CL (see [Experimental Features](#experimental-features) below), the process using the VC4CL library needs to be either `root` (e.g. via `sudo <program>`) or be in the `video` group).
 The `v3d_info` and `v3d_profiling` tools in this project need to be run as root to give the maximum amount of information.
 
+On current Raspberry Pi OS, where the GPU is driven by the Linux `vc4` DRM driver (`dtoverlay=vc4-kms-v3d`), see [KMS.md](KMS.md) for known issues and limitations.
+
 ## Debug
 Since this software is still in development, some functionality might not work.
 For curious users or to be able to provide more information for bugs, additional debug information can be generated if desired.

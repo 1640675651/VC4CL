@@ -316,6 +316,15 @@ bool SystemAccess::deallocateBuffer(const DeviceBuffer* buffer)
 {
     if(isEmulated)
         deallocateEmulatorBuffer(buffer);
+    if(v3d && v3d->isHung())
+    {
+        // The QPUs might still be writing to this buffer, so freeing it could let them overwrite whatever reuses the
+        // memory next. Leak it instead.
+        DEBUG_LOG(DebugLevel::MEMORY,
+            std::cout << "[VC4CL] Not freeing buffer at device address 0x" << std::hex << buffer->qpuPointer
+                      << std::dec << ", since the GPU is hung" << std::endl)
+        return true;
+    }
     #ifndef NO_VCSM	
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
         return vcsm->deallocateBuffer(buffer);

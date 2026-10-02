@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <utility>
 
 namespace vc4cl
@@ -222,8 +223,32 @@ namespace vc4cl
 
         bool readValue(SystemQuery query, uint32_t& output) noexcept;
 
+        /*
+         * Whether a kernel execution timed out and the QPUs could not be confirmed to be stopped.
+         *
+         * In this state, the QPUs might still be running and writing to memory, so no more kernels are executed and no
+         * GPU memory is freed.
+         */
+        bool isHung() const noexcept
+        {
+            return hung;
+        }
+
     private:
-        uint32_t* v3dBasePointer;
+        volatile uint32_t* v3dBasePointer;
+
+        /*
+         * The runtime PM sysfs directory of the V3D device, if V3D is managed by the Linux vc4 DRM driver (KMS),
+         * empty otherwise.
+         */
+        std::string pmDirectory;
+        // The original value of the runtime PM control file, if we changed it
+        std::string originalPmControl;
+        bool hung = false;
+
+        bool ensurePoweredOn();
+        bool isPoweredOn() const;
+        void recoverFromTimeout();
     };
 
     void* mapmem(unsigned base, unsigned size);

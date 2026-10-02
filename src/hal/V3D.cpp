@@ -11,11 +11,14 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <dirent.h>
 #include <fcntl.h>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sys/mman.h>
 #include <system_error>
+#include <thread>
 #include <unistd.h>
 
 using namespace vc4cl;
@@ -43,18 +46,161 @@ static constexpr uint32_t V3D_ERRORS = 0x0F20 / sizeof(uint32_t);
 static constexpr uint32_t V3D_COUNTER_INCREMENT = 0x0008 / sizeof(uint32_t);
 static constexpr uint32_t V3D_LENGTH = ((V3D_ERRORS - V3D_IDENT0) + 16) * sizeof(uint32_t);
 
-V3D::V3D()
+// The lower 24 bits of V3D_IDENT0 contain the characters "V3D"
+static constexpr uint32_t V3D_IDENT0_MAGIC = 0x443356;
+// The VPM memory to reserve for user programs, in multiples of 256 bytes. 16 * 256 = 4 KB is the most VC4C uses (see
+// VPM_DEFAULT_SIZE).
+static constexpr uint32_t VPM_USER_RESERVATION = 16;
+
+static constexpr std::chrono::milliseconds POWER_ON_TIMEOUT{1000};
+// Needs to be longer than the runtime PM autosuspend delay (40ms for vc4)
+static constexpr std::chrono::milliseconds POWER_OFF_TIMEOUT{2000};
+
+/*
+ * If V3D is managed by the Linux vc4 DRM driver (the KMS graphics stack), returns the runtime PM sysfs directory of the
+ * V3D device. Returns an empty string if V3D is managed by the VideoCore firmware.
+ */
+static std::string findV3DPowerDirectory()
+{
+    static const std::string driverDirectory = "/sys/bus/platform/drivers/vc4_v3d/";
+    std::unique_ptr<DIR, decltype(&closedir)> dir{opendir(driverDirectory.data()), closedir};
+    if(!dir)
+        return "";
+    while(auto entry = readdir(dir.get()))
+    {
+        // the bound device is named after its address, e.g. "3fc00000.v3d"
+        std::string name = entry->d_name;
+        if(name.find(".v3d") != std::string::npos)
+            return driverDirectory + name + "/power/";
+    }
+    return "";
+}
+
+static std::string readSysfs(const std::string& path)
+{
+    std::ifstream file{path};
+    std::string value;
+    std::getline(file, value);
+    return value;
+}
+
+static bool writeSysfs(const std::string& path, const std::string& value)
+{
+    std::ofstream file{path};
+    file << value;
+    file.flush();
+    return file.good();
+}
+
+static bool waitForRuntimeStatus(
+    const std::string& pmDirectory, const std::string& status, std::chrono::milliseconds timeout)
+{
+    const auto start = std::chrono::steady_clock::now();
+    while(readSysfs(pmDirectory + "runtime_status") != status)
+    {
+        if(std::chrono::steady_clock::now() - start > timeout)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    }
+    return true;
+}
+
+static inline void memoryBarrier()
+{
+#if defined(__aarch64__) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7)
+    // makes sure all previous memory accesses (e.g. writing UNIFORMs and code) are complete before the QPUs start
+    __asm__ __volatile__("dsb sy" ::: "memory");
+#else
+    __sync_synchronize();
+#endif
+}
+
+V3D::V3D() : pmDirectory(findV3DPowerDirectory())
 {
     bcm_host_init();
-    v3dBasePointer = static_cast<uint32_t*>(
+    v3dBasePointer = static_cast<volatile uint32_t*>(
         mapmem(busAddressToPhysicalAddress(bcm_host_get_peripheral_address() + V3D_BASE_OFFSET), V3D_LENGTH));
-    DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] V3D base: " << v3dBasePointer << std::endl)
+    DEBUG_LOG(DebugLevel::SYSCALL, std::cout << "[VC4CL] V3D base: " << const_cast<uint32_t*>(v3dBasePointer) << std::endl)
+    if(!pmDirectory.empty())
+    {
+        DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
+            std::cout << "[VC4CL] V3D is managed by the vc4 DRM driver, runtime PM: " << pmDirectory << std::endl)
+        // The vc4 DRM driver powers off V3D when it is not used by any DRM client, so we need to keep it powered on
+        if(!ensurePoweredOn())
+            std::cout << "[VC4CL] Failed to power on V3D, kernel execution via register poking will fail!"
+                      << std::endl;
+    }
 }
 
 V3D::~V3D()
 {
-    unmapmem(v3dBasePointer, V3D_LENGTH);
+    if(!originalPmControl.empty())
+    {
+        // Allow the vc4 DRM driver to power off V3D again
+        if(!writeSysfs(pmDirectory + "control", originalPmControl))
+            std::cout << "[VC4CL] Failed to restore V3D runtime PM control: " << originalPmControl << std::endl;
+    }
+    unmapmem(const_cast<uint32_t*>(v3dBasePointer), V3D_LENGTH);
     bcm_host_deinit();
+}
+
+bool V3D::ensurePoweredOn()
+{
+    auto control = readSysfs(pmDirectory + "control");
+    if(control != "on")
+    {
+        if(!writeSysfs(pmDirectory + "control", "on"))
+        {
+            std::cout << "[VC4CL] Failed to disable V3D runtime PM via " << pmDirectory << "control (need root)"
+                      << std::endl;
+            return false;
+        }
+        if(originalPmControl.empty())
+            originalPmControl = control;
+        DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
+            std::cout << "[VC4CL] Disabled V3D runtime PM (was: " << control << ")" << std::endl)
+    }
+    return waitForRuntimeStatus(pmDirectory, "active", POWER_ON_TIMEOUT);
+}
+
+bool V3D::isPoweredOn() const
+{
+    // a powered off V3D returns 0xdeadbeef for all registers
+    if((v3dBasePointer[V3D_IDENT0] & 0xFFFFFF) != V3D_IDENT0_MAGIC)
+        return false;
+    return pmDirectory.empty() || readSysfs(pmDirectory + "runtime_status") == "active";
+}
+
+void V3D::recoverFromTimeout()
+{
+    // The QPUs might still be running and might write to any memory (there is no MMU), so until we know they are
+    // stopped, do not execute anything else and do not free any memory they could access.
+    hung = true;
+    std::cout << "[VC4CL] Kernel execution timed out, the QPUs might still be running!" << std::endl;
+    if(pmDirectory.empty())
+    {
+        std::cout << "[VC4CL] Cannot reset V3D, no more kernels will be executed and GPU memory will not be freed"
+                  << std::endl;
+        return;
+    }
+
+    // Reset V3D the same way the vc4 DRM driver does (see vc4_reset()): Let it runtime suspend, which powers it off,
+    // then power it on again. Runtime suspend only happens if no DRM client is using V3D at the moment.
+    bool suspended = writeSysfs(pmDirectory + "control", "auto") &&
+        waitForRuntimeStatus(pmDirectory, "suspended", POWER_OFF_TIMEOUT);
+    // the temporary "auto" is not the value to restore on exit
+    auto savedPmControl = originalPmControl;
+    bool resumed = ensurePoweredOn();
+    originalPmControl = savedPmControl;
+    if(suspended && resumed)
+    {
+        hung = false;
+        std::cout << "[VC4CL] V3D was reset by power-cycling it" << std::endl;
+    }
+    else
+        std::cout << "[VC4CL] Failed to reset V3D (is another program using the GPU?), no more kernels will be "
+                     "executed and GPU memory will not be freed"
+                  << std::endl;
 }
 
 uint32_t V3D::getSystemInfo(const SystemInfo key) const
@@ -189,6 +335,21 @@ ExecutionHandle V3D::executeQPU(
     // https://vc4-notes.tumblr.com/post/125039428234/v3d-registers-not-on-videocore-iv-3d-architecture
     // see errata: https://elinux.org/VideoCore_IV_3D_Architecture_Reference_Guide_errata
 
+    if(hung)
+    {
+        std::cout << "[VC4CL] Not executing kernel, since a previous kernel execution did not finish!" << std::endl;
+        return ExecutionHandle{false};
+    }
+    if((!pmDirectory.empty() && !ensurePoweredOn()) || !isPoweredOn())
+    {
+        std::cout << "[VC4CL] Not executing kernel, since V3D is powered off!" << std::endl;
+        return ExecutionHandle{false};
+    }
+    // The vc4 DRM driver sets the VPM memory reserved for user programs to 0 every time V3D is powered on, since it
+    // does not support user programs.
+    if((v3dBasePointer[V3D_VPMBASE] & 0x1F) < VPM_USER_RESERVATION)
+        v3dBasePointer[V3D_VPMBASE] = VPM_USER_RESERVATION;
+
     // clear cache (if set)
     // FIXME when the buffer-flush is disabled (for any consecutive execution), the updated UNIFORM-values are not used,
     // but the old ones!
@@ -205,6 +366,8 @@ ExecutionHandle V3D::executeQPU(
     // reset user program states
     v3dBasePointer[V3D_SRQCS] = (1 << 7) | (1 << 8) | (1 << 16);
 
+    memoryBarrier();
+
     // write uniforms and instructions addresses for all QPUs
     uint32_t* addressBase = addressPairs.first;
     for(unsigned i = 0; i < numQPUs; ++i)
@@ -215,12 +378,11 @@ ExecutionHandle V3D::executeQPU(
     }
 
     const auto start = std::chrono::high_resolution_clock::now();
-    auto basePointer = v3dBasePointer;
-    auto checkFunc = [basePointer, numQPUs, start, timeout]() -> bool {
+    auto checkFunc = [this, numQPUs, start, timeout]() -> bool {
         // wait for completion
         while(true)
         {
-            if(((basePointer[V3D_SRQCS] >> 16) & 0xFF) == numQPUs)
+            if(((v3dBasePointer[V3D_SRQCS] >> 16) & 0xFF) == numQPUs)
                 return true;
             if(std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::high_resolution_clock::now() - start) > timeout)
@@ -229,6 +391,7 @@ ExecutionHandle V3D::executeQPU(
             // e.g. sleep for the theoretical execution time of the kernel (e.g. #instructions / QPU clock) and then
             // begin active waiting
         }
+        recoverFromTimeout();
         return false;
     };
     return ExecutionHandle{checkFunc};
