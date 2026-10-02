@@ -36,6 +36,14 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    if(system()->getDRMIfAvailable())
+    {
+        // The vc4 driver resets V3D itself when a kernel times out
+        std::cout << "V3D is managed by the vc4 DRM driver with compute job support, which resets it itself. Use "
+                     "VC4CL_NO_DRM=1 to access V3D directly anyway."
+                  << std::endl;
+        return 1;
+    }
     auto v3d = system()->getV3DIfAvailable();
     if(!v3d)
     {

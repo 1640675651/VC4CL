@@ -17,6 +17,7 @@ namespace vc4cl
 {
     constexpr uint32_t PAGE_ALIGNMENT = 4096;
 
+    class DRM;
     class Mailbox;
     class V3D;
     #ifndef NO_VCSM
@@ -36,12 +37,16 @@ namespace vc4cl
     {
         MAILBOX_IOCTL,
         V3D_REGISTER_POKING,
-        VCHI_GPU_SERVICE
+        VCHI_GPU_SERVICE,
+        // compute jobs of the (patched) vc4 DRM driver
+        VC4_DRM
     };
 
     enum class MemoryManagement : uint8_t
-    {       
+    {
         MAILBOX,
+        // buffer objects of the vc4 DRM driver
+        VC4_DRM,
 	#ifndef NO_VCSM
         VCSM,
         VCSM_CMA
@@ -102,6 +107,11 @@ namespace vc4cl
         std::string getModelType();
         std::string getProcessorType();
 
+        inline DRM* getDRMIfAvailable()
+        {
+            return drm.get();
+        }
+
         inline Mailbox* getMailboxIfAvailable()
         {
             return mailbox.get();
@@ -130,9 +140,19 @@ namespace vc4cl
         bool deallocateBuffer(const DeviceBuffer* buffer);
         bool flushCPUCache(const std::vector<const DeviceBuffer*>& buffers);
 
+        /*
+         * Executes the QPU programs given by the launch messages at controlAddress.
+         *
+         * buffers contains all buffers accessed by the programs (code, UNIFORMs, kernel arguments).
+         */
         CHECK_RETURN ExecutionHandle executeQPU(unsigned numQPUs, std::pair<uint32_t*, unsigned> controlAddress,
-            bool flushBuffer, std::chrono::milliseconds timeout);
+            const std::vector<const DeviceBuffer*>& buffers, bool flushBuffer, std::chrono::milliseconds timeout);
 
+    private:
+        // Declared (and therefore initialized) first, since its availability selects the modes below
+        std::unique_ptr<DRM> drm;
+
+    public:
         const bool isEmulated;
         const ExecutionMode executionMode;
         const MemoryManagement memoryManagement;

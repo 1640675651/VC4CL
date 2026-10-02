@@ -1,5 +1,6 @@
 target_sources(VC4CL
   PRIVATE
+    hal/DRM.cpp
     hal/emulator.cpp
     hal/hal.cpp
     hal/Mailbox.cpp

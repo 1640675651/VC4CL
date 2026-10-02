@@ -224,6 +224,28 @@ static bool flushHostCache(SystemAccess& system, const std::unique_ptr<DeviceBuf
     return status;
 }
 
+// All buffers the kernel execution accesses, see SystemAccess#executeQPU()
+static std::vector<const DeviceBuffer*> collectBuffers(const std::unique_ptr<DeviceBuffer>& kernelBuffer,
+    const std::map<unsigned, std::unique_ptr<DeviceBuffer>>& tmpBuffers,
+    const std::map<unsigned, std::pair<std::shared_ptr<DeviceBuffer>, DevicePointer>>& persistentBuffers)
+{
+    std::vector<const DeviceBuffer*> buffers;
+    buffers.reserve(1 + tmpBuffers.size() + persistentBuffers.size());
+    buffers.emplace_back(kernelBuffer.get());
+    for(auto& buf : tmpBuffers)
+    {
+        if(buf.second)
+            buffers.emplace_back(buf.second.get());
+    }
+    for(auto& buf : persistentBuffers)
+    {
+        // NULL pointer arguments have no buffer
+        if(buf.second.first)
+            buffers.emplace_back(buf.second.first.get());
+    }
+    return buffers;
+}
+
 cl_int executeKernel(KernelExecution& args)
 {
     const Kernel* kernel = args.kernel.get();
@@ -451,6 +473,7 @@ cl_int executeKernel(KernelExecution& args)
     //
     // calculate execution timeout depending on the number of work-groups to be executed at once
     auto timeout = KERNEL_TIMEOUT * std::max(std::size_t{30}, group_limits[0] * group_limits[1] * group_limits[2]);
+    const auto accessedBuffers = collectBuffers(buffer, args.tmpBuffers, args.persistentBuffers);
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
         std::cout << "Running work-group " << group_indices[0] << ", " << group_indices[1] << ", " << group_indices[2]
@@ -471,7 +494,8 @@ cl_int executeKernel(KernelExecution& args)
     // on first execution, flush code cache
     auto start = std::chrono::high_resolution_clock::now();
     auto result = args.system->executeQPU(static_cast<unsigned>(numQPUs),
-        std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), true, timeout);
+        std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), accessedBuffers, true,
+        timeout);
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
         // NOTE: This disables background-execution!
         auto success = result.waitFor();
@@ -504,7 +528,8 @@ cl_int executeKernel(KernelExecution& args)
                       << group_indices[2] << std::endl)
         // all following executions, don't flush cache
         result = args.system->executeQPU(static_cast<unsigned>(numQPUs),
-            std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), false, timeout);
+            std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), accessedBuffers, false,
+            timeout);
         // NOTE: This disables background-execution!
         DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
             std::cout << "Execution: " << (result.waitFor() ? "successful" : "failed") << std::endl)

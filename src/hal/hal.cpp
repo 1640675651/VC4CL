@@ -6,6 +6,7 @@
 
 #include "hal.h"
 
+#include "DRM.h"
 #include "Mailbox.h"
 #include "V3D.h"
 #include "VCHI.h"
@@ -35,8 +36,25 @@ static bool isRoot()
     return geteuid() == 0;
 }
 
-static ExecutionMode getExecMode()
+static std::unique_ptr<DRM> initializeDRM(bool isEmulated)
 {
+    if(isEmulated || std::getenv("VC4CL_NO_DRM"))
+        return nullptr;
+    // Selecting any other system access explicitly disables the DRM backend, since it handles both memory and execution
+    for(const char* env : {"VC4CL_EXECUTE_REGISTER_POKING", "VC4CL_EXECUTE_MAILBOX", "VC4CL_EXECUTE_VCHI",
+            "VC4CL_MEMORY_CMA", "VC4CL_MEMORY_VCSM", "VC4CL_MEMORY_MAILBOX"})
+    {
+        if(std::getenv(env))
+            return nullptr;
+    }
+    return DRM::create();
+}
+
+static ExecutionMode getExecMode(bool hasDRM)
+{
+    // Kernels running as compute jobs of the vc4 DRM driver can only access buffers of the driver
+    if(hasDRM)
+        return ExecutionMode::VC4_DRM;
     if(std::getenv("VC4CL_EXECUTE_REGISTER_POKING"))
         return ExecutionMode::V3D_REGISTER_POKING;
     if(std::getenv("VC4CL_EXECUTE_MAILBOX"))
@@ -50,8 +68,10 @@ static ExecutionMode getExecMode()
     return isRoot() ? ExecutionMode::V3D_REGISTER_POKING : ExecutionMode::VCHI_GPU_SERVICE;
 }
 
-static MemoryManagement getMemoryMode()
+static MemoryManagement getMemoryMode(bool hasDRM)
 {
+    if(hasDRM)
+        return MemoryManagement::VC4_DRM;
     #ifndef NO_VCSM
     if(std::getenv("VC4CL_MEMORY_CMA"))
         return MemoryManagement::VCSM_CMA;
@@ -103,6 +123,15 @@ static std::unique_ptr<V3D> initializeV3D(bool isEmulated, ExecutionMode execMod
         // explicitly disabled
         return nullptr;
 
+    if(execMode == ExecutionMode::VC4_DRM)
+    {
+        // Accessing the V3D registers directly would interfere with the driver (e.g. keeping V3D powered on prevents
+        // the driver from resetting it)
+        DEBUG_LOG(DebugLevel::PERFORMANCE_COUNTERS,
+            std::cout << "[VC4CL] Performance counters are not supported with the vc4 DRM backend" << std::endl)
+        return nullptr;
+    }
+
     if(isDebugModeEnabled(DebugLevel::PERFORMANCE_COUNTERS) || execMode == ExecutionMode::V3D_REGISTER_POKING ||
         isRoot() /* we are root (or at least have root rights), so we can access the registers */)
         return std::unique_ptr<V3D>(new V3D());
@@ -136,9 +165,10 @@ static std::unique_ptr<VCHI> initializeVCHI(bool isEmulated, ExecutionMode execM
 }
 
 SystemAccess::SystemAccess() :
-    isEmulated(getEmulated()), 
-    executionMode(getExecMode()), 
-    memoryManagement(getMemoryMode()),	
+    drm(initializeDRM(getEmulated())),
+    isEmulated(getEmulated()),
+    executionMode(getExecMode(drm != nullptr)),
+    memoryManagement(getMemoryMode(drm != nullptr)),
     forcedCacheType(getForcedCacheType()), 
     mailbox(initializeMailbox(isEmulated, executionMode, memoryManagement)),
     v3d(initializeV3D(isEmulated, executionMode)), 
@@ -149,6 +179,10 @@ SystemAccess::SystemAccess() :
 {
     if(isEmulated)
         DEBUG_LOG(DebugLevel::SYSTEM_ACCESS, std::cout << "[VC4CL] Using emulated system accesses " << std::endl)
+    if(drm)
+        DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
+            std::cout << "[VC4CL] Using vc4 DRM driver (" << drm->devicePath
+                      << ") for: kernel execution, memory allocation, system queries" << std::endl)
     if(mailbox)
         DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
             std::cout << "[VC4CL] Using mailbox for: "
@@ -212,6 +246,8 @@ uint32_t SystemAccess::querySystem(SystemQuery query, uint32_t defaultValue)
     uint32_t value = defaultValue;
     if(isEmulated)
         return getEmulatedSystemQuery(query);
+    if(drm && drm->readValue(query, value))
+        return value;
     #ifndef NO_VCSM
     if(vcsm && vcsm->readValue(query, value))
         return value;
@@ -296,6 +332,9 @@ std::unique_ptr<DeviceBuffer> SystemAccess::allocateBuffer(
 {
     if(isEmulated)
         return allocateEmulatorBuffer(shared_from_this(), sizeInBytes);
+    if(drm && memoryManagement == MemoryManagement::VC4_DRM)
+        // vc4 buffers are always mapped write-combined on the host
+        return drm->allocateBuffer(shared_from_this(), sizeInBytes, name);
     auto effectiveCacheType = forcedCacheType.first ? forcedCacheType.second : cacheType;
     #ifndef NO_VCSM
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
@@ -316,6 +355,8 @@ bool SystemAccess::deallocateBuffer(const DeviceBuffer* buffer)
 {
     if(isEmulated)
         deallocateEmulatorBuffer(buffer);
+    if(drm && memoryManagement == MemoryManagement::VC4_DRM)
+        return drm->deallocateBuffer(buffer);
     if(v3d && v3d->isHung())
     {
         // The QPUs might still be writing to this buffer, so freeing it could let them overwrite whatever reuses the
@@ -336,6 +377,9 @@ bool SystemAccess::deallocateBuffer(const DeviceBuffer* buffer)
 
 bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers)
 {
+    if(drm && memoryManagement == MemoryManagement::VC4_DRM)
+        // write-combined on the host and the driver flushes the GPU caches before each job, nothing to do
+        return true;
     #ifndef NO_VCSM
     if(vcsm && (memoryManagement == MemoryManagement::VCSM || memoryManagement == MemoryManagement::VCSM_CMA))
         return vcsm->flushCPUCache(buffers);
@@ -344,10 +388,12 @@ bool SystemAccess::flushCPUCache(const std::vector<const DeviceBuffer*>& buffers
 }
 
 ExecutionHandle SystemAccess::executeQPU(unsigned numQPUs, std::pair<uint32_t*, unsigned> controlAddress,
-    bool flushBuffer, std::chrono::milliseconds timeout)
+    const std::vector<const DeviceBuffer*>& buffers, bool flushBuffer, std::chrono::milliseconds timeout)
 {
     if(isEmulated)
         return ExecutionHandle(emulateQPU(numQPUs, controlAddress.second, timeout));
+    if(drm && executionMode == ExecutionMode::VC4_DRM)
+        return drm->executeQPU(numQPUs, controlAddress, buffers, timeout);
     if(vchi && executionMode == ExecutionMode::VCHI_GPU_SERVICE)
         return vchi->executeQPU(numQPUs, controlAddress, flushBuffer, timeout);
     if(mailbox && executionMode == ExecutionMode::MAILBOX_IOCTL)

@@ -233,6 +233,16 @@ bool Mailbox::readValue(SystemQuery query, uint32_t& output) noexcept
     return false;
 }
 
+bool vc4cl::firmwarePropertyCall(void* buffer)
+{
+    int fd = open(DEVICE_FILE_NAME, 0);
+    if(fd < 0)
+        return false;
+    int status = ioctl(fd, IOCTL_MBOX_PROPERTY, buffer);
+    close(fd);
+    return status >= 0;
+}
+
 /*
  * use ioctl to send mbox property message
  */

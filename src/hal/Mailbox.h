@@ -234,6 +234,13 @@ namespace vc4cl
         }
     };
 
+    /*
+     * Sends a single property message to the firmware, without a Mailbox instance (which changes the QPU enable state
+     * on creation and destruction). Returns whether the message was sent, not whether the firmware handled it (see
+     * MailboxMessage#isSuccessful()).
+     */
+    bool firmwarePropertyCall(void* buffer);
+
     template <MailboxTag Tag>
     using SimpleQueryMessage =
         MailboxMessage<Tag, 0 /* no additional request data */, 2 /* one or two response values */>;

@@ -1,7 +1,8 @@
 # Running VC4CL on the vc4 DRM driver
 
-Status: the kernel side is implemented in [`../vc4-compute/`](../vc4-compute/README.md) and tested on
-hardware (see [Test results](#test-results)). The VC4CL side isn't started.
+Status: implemented and tested on hardware. The kernel side is in
+[`../vc4-compute/`](../vc4-compute/README.md); the VC4CL side is the DRM backend in `src/hal/DRM.cpp`. See
+[Test results](#test-results).
 
 ## Goal
 
@@ -212,7 +213,7 @@ group effectively get root rights, so the administrator has to choose it deliber
 | `vc4_v3d.c` | runtime-PM fix in `vc4_v3d_bind()` |
 | `Makefile` | `vc4_compute.o` |
 
-## VC4CL changes (next step)
+## VC4CL changes
 
 A new HAL backend, `src/hal/DRM.cpp`, selected when `/dev/dri/renderD*` is a vc4 device whose
 `GET_PARAM` reports `SUPPORTS_QPU_COMPUTE`:
@@ -227,8 +228,24 @@ A new HAL backend, `src/hal/DRM.cpp`, selected when `/dev/dri/renderD*` is a vc4
   start, so no explicit flushing is needed.
 - **Registers:** none touched. The register-poking and Mailbox paths stay for the firmware stack.
 
-The executor currently passes raw pointers into one big buffer. It also needs to collect the BO
-handles of all buffers a launch uses.
+The executor collects all buffers a launch uses (kernel buffer, temporary buffers, argument buffers)
+and passes them to `SystemAccess::executeQPU()`. The DRM backend removes duplicate handles, since the
+driver locks each BO once: a buffer passed as two arguments would otherwise make the submission fail.
+
+As implemented:
+
+- `DRM::create()` probes `/dev/dri/renderD128`–`191` for a vc4 device that reports
+  `SUPPORTS_QPU_COMPUTE`, then checks permission with a trial `QPU_BO_ADDR`. If the driver supports
+  compute but the process isn't allowed to use it, VC4CL prints a hint about root or `compute_gid`.
+  Without it, VC4CL would silently fall back to the old backends.
+- The DRM backend is used for memory and execution together, or not at all. It's skipped when
+  `VC4CL_NO_DRM` or any of the existing `VC4CL_EXECUTE_*`/`VC4CL_MEMORY_*` overrides is set.
+- In DRM mode, no V3D or Mailbox object is created. The V3D one would set `power/control` to `on` and
+  block the driver's reset. This also means performance counters are unavailable in DRM mode.
+- System queries: QPU count and VPM size come from `GET_PARAM(V3D_IDENT1)`; global memory from
+  `CmaTotal`; the QPU clock through a read-only firmware query (`firmwarePropertyCall()`, which needs
+  no `Mailbox` instance); the temperature and ARM clock from sysfs.
+- `v3d_reset` refuses to run in DRM mode, since the driver resets V3D itself.
 
 ## Testing plan
 
@@ -262,6 +279,21 @@ running, `tests/compute_test` from vc4-compute:
 Between tests, V3D runtime-suspends as expected, which confirms the backported `vc4_v3d_bind()` fix.
 The buffer addresses (e.g. `0xee185000`) are CMA memory seen through the GPU's `0xC0000000`
 (uncached) alias. `gpu_mem` isn't used.
+
+### VC4CL through the DRM backend
+
+Same setup, desktop running, VC4CL run **as a normal user** with `compute_gid=44`:
+
+| Test | Result |
+|---|---|
+| `clinfo` | uses `/dev/dri/renderD128`; 300 MHz; global memory 256 MiB (CMA), was 76 MiB (`gpu_mem`); max allocation 128 MiB |
+| vector-add demo | correct; one job with 8 programs and 3 buffers, 391 µs (599 µs with register poking) |
+| never-ending kernel, then a second kernel in the same process | first: `CL_OUT_OF_RESOURCES` after VC4CL's 30 s timeout, with one GPU reset; second: correct results in 1 ms |
+| clpeak | **runs to the end** (exit 0), with no GPU resets and no kernel warnings. Register poking hung at the `float4` compute test and corrupted kernel memory. Bandwidth `float`…`float16`: 0.23–1.44 GB/s; it was skipped before, because the allocation failed. Single-precision compute: 0.61 / 1.19 / 2.26 / 3.89 / 6.12 GFLOPS, about twice register poking's 0.30 / 0.60 (cause not investigated). Integer: 0.18–1.42 GOPS, 24-bit: 0.60–5.85. Transfers: writes 1.0–1.2 GB/s, reads 0.12–0.13 GB/s. Kernel launch latency: 23 µs. |
+
+Reading from vc4 BOs on the CPU is slow (0.13 GB/s), because the driver maps them write-combined,
+i.e. uncached for reads. Programs reading large results back would profit from a cached mapping with
+explicit cache maintenance; that's a possible follow-up.
 
 ## Open questions
 

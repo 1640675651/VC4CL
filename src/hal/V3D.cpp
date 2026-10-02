@@ -17,7 +17,6 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <system_error>
 #include <thread>
@@ -114,25 +113,10 @@ static bool waitForRuntimeStatus(
     return true;
 }
 
-/*
- * Sends a property message to the firmware.
- *
- * NOTE: Not using the Mailbox class, since creating an instance of it changes the QPU enable state.
- */
-static bool firmwareCall(void* buffer)
-{
-    int fd = open("/dev/vcio", 0);
-    if(fd < 0)
-        return false;
-    int status = ioctl(fd, _IOWR(100, 0, char*), buffer);
-    close(fd);
-    return status >= 0;
-}
-
 static bool getV3DPowerDomainState(bool& isOn)
 {
     MailboxMessage<MailboxTag::GET_DOMAIN_STATE, 2, 2> msg({FIRMWARE_V3D_POWER_DOMAIN, 0});
-    if(!firmwareCall(msg.buffer.data()) || !msg.isSuccessful())
+    if(!firmwarePropertyCall(msg.buffer.data()) || !msg.isSuccessful())
         return false;
     isOn = msg.getContent(1) != 0;
     return true;
@@ -141,7 +125,7 @@ static bool getV3DPowerDomainState(bool& isOn)
 static bool setV3DPowerDomainState(bool on)
 {
     MailboxMessage<MailboxTag::SET_DOMAIN_STATE, 2, 2> msg({FIRMWARE_V3D_POWER_DOMAIN, on ? 1u : 0u});
-    return firmwareCall(msg.buffer.data()) && msg.isSuccessful();
+    return firmwarePropertyCall(msg.buffer.data()) && msg.isSuccessful();
 }
 
 static inline void memoryBarrier()
