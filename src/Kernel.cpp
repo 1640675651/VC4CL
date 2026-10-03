@@ -333,6 +333,15 @@ cl_int Kernel::getInfo(
         CL_INVALID_VALUE, __FILE__, __LINE__, buildString("Invalid cl_kernel_info value %d", param_name));
 }
 
+/*
+ * The maximum number of work-items in a work-group of a kernel: one work-item per QPU, or, for kernels running one
+ * work-item per SIMD lane (SIMT mode, merge factor > 1), the work-items of a single QPU.
+ */
+static cl_uint getMaxWorkGroupSize(uint8_t mergeFactor)
+{
+    return mergeFactor > 1 ? mergeFactor : system()->getNumQPUs();
+}
+
 cl_int Kernel::getWorkGroupInfo(
     cl_kernel_work_group_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret)
 {
@@ -345,9 +354,8 @@ cl_int Kernel::getWorkGroupInfo(
     case CL_KERNEL_WORK_GROUP_SIZE:
     {
         //"[...] query the maximum work-group size that can be used to execute a kernel on a specific device [...]"
-        auto mergeFactor = std::max(info.workItemMergeFactor, uint8_t{1});
         return returnValue<size_t>(
-            system()->getNumQPUs() * mergeFactor, param_value_size, param_value, param_value_size_ret);
+            getMaxWorkGroupSize(info.workItemMergeFactor), param_value_size, param_value, param_value_size_ret);
     }
     case CL_KERNEL_COMPILE_WORK_GROUP_SIZE:
     {
@@ -431,7 +439,7 @@ static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NU
     if(compile_group_sizes[0] == 0 && compile_group_sizes[1] == 0 && compile_group_sizes[2] == 0)
         // no compile-time sizes set
         return false;
-    const cl_uint max_group_size = system()->getNumQPUs() * mergeFactor;
+    const cl_uint max_group_size = getMaxWorkGroupSize(mergeFactor);
 
     if((global_sizes[0] % compile_group_sizes[0]) != 0 || (global_sizes[1] % compile_group_sizes[1]) != 0 ||
         (global_sizes[2] % compile_group_sizes[2]) != 0)
@@ -458,8 +466,9 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
     std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, cl_uint num_dimensions, uint8_t mergeFactor)
 {
     const size_t total_sizes = global_sizes[0] * global_sizes[1] * global_sizes[2];
-    const cl_uint max_group_size = system()->getNumQPUs() * mergeFactor;
-    if(total_sizes <= max_group_size)
+    const cl_uint max_group_size = getMaxWorkGroupSize(mergeFactor);
+    // SIMT kernels only support 1-dimensional work-groups
+    if(total_sizes <= max_group_size && (mergeFactor <= 1 || (global_sizes[1] == 1 && global_sizes[2] == 1)))
     {
         // can be executed in a single work-group
         local_sizes[0] = global_sizes[0];
@@ -608,10 +617,15 @@ cl_int Kernel::setWorkGroupSizes(CommandQueue* commandQueue, cl_uint work_dim, c
                 work_sizes[1] + work_offsets[1], kernel_config::MAX_WORK_ITEM_DIMENSIONS[1],
                 work_sizes[2] + work_offsets[2], kernel_config::MAX_WORK_ITEM_DIMENSIONS[2]));
     }
-    if(exceedsLimits<size_t>(local_sizes[0] * local_sizes[1] * local_sizes[2], 0, system()->getNumQPUs() * mergeFactor))
+    if(exceedsLimits<size_t>(local_sizes[0] * local_sizes[1] * local_sizes[2], 0, getMaxWorkGroupSize(mergeFactor)))
         return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
             buildString("Local work-sizes exceed maximum: %u * %u * %u > %u", local_sizes[0], local_sizes[1],
-                local_sizes[2], system()->getNumQPUs() * mergeFactor));
+                local_sizes[2], getMaxWorkGroupSize(mergeFactor)));
+    if(mergeFactor > 1 && (local_sizes[1] != 1 || local_sizes[2] != 1))
+        return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
+            buildString("Kernels running one work-item per SIMD lane only support 1-dimensional work-groups: %u * %u "
+                        "* %u",
+                local_sizes[0], local_sizes[1], local_sizes[2]));
 
     // check divisibility of local_sizes[i] by work_sizes[i]
     for(cl_uint i = 0; i < kernel_config::NUM_DIMENSIONS; ++i)

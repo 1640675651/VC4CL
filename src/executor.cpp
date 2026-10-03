@@ -32,6 +32,10 @@ static const std::chrono::milliseconds KERNEL_TIMEOUT{1000};
 // uniform address, max_group_id (x, y, z)
 static const unsigned MAX_HIDDEN_PARAMETERS = 14;
 
+// The maximum number of UNIFORM words for the work-groups of a single launch of a SIMT kernel (see below). Larger
+// NDRanges are split into several launches.
+static const std::size_t MAX_SIMT_UNIFORM_WORDS = 64 * 1024;
+
 static unsigned AS_GPU_ADDRESS(const unsigned* ptr, DeviceBuffer* buffer)
 {
     const char* tmp = *reinterpret_cast<const char**>(&ptr);
@@ -129,6 +133,18 @@ static bool increment_index(std::array<std::size_t, kernel_config::NUM_DIMENSION
         }
     }
     return indices[2] < limits[2];
+}
+
+// Advances the indices by count positions, returns whether the end was not reached
+static bool advance_index(std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& indices,
+    const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& limits, std::size_t count)
+{
+    for(std::size_t i = 0; i < count; ++i)
+    {
+        if(!increment_index(indices, limits, 1))
+            return false;
+    }
+    return true;
 }
 
 static void dumpBuffer(std::ostream& os, const DeviceBuffer* buffer)
@@ -251,45 +267,66 @@ cl_int executeKernel(KernelExecution& args)
     const Kernel* kernel = args.kernel.get();
     CHECK_KERNEL(kernel)
 
-    // the number of QPUs is the product of all local sizes
-    auto mergeFactor = std::max(kernel->info.workItemMergeFactor, uint8_t{1});
-    size_t localSize = args.localSizes[0] * args.localSizes[1] * args.localSizes[2];
-    size_t numQPUs = (localSize / mergeFactor) + (localSize % mergeFactor != 0);
-    if(numQPUs > args.system->getNumQPUs())
-        return CL_INVALID_GLOBAL_WORK_SIZE;
-
-    if(numQPUs == 0)
-        // OpenCL 3.0 requires that we allow to enqueue a kernel without any executions for some reason
-        return CL_COMPLETE;
-
     // first work-group has group_ids 0,0,0
     const std::array<std::size_t, kernel_config::NUM_DIMENSIONS> group_limits = {
         args.globalSizes[0] / args.localSizes[0],
         args.globalSizes[1] / args.localSizes[1],
         args.globalSizes[2] / args.localSizes[2],
     };
+    const size_t numGroups = group_limits[0] * group_limits[1] * group_limits[2];
+
+    auto mergeFactor = std::max(kernel->info.workItemMergeFactor, uint8_t{1});
+    size_t localSize = args.localSizes[0] * args.localSizes[1] * args.localSizes[2];
+    // Kernels running one work-item per SIMD lane (SIMT mode) run a whole work-group on a single QPU and several
+    // work-groups in parallel, one per QPU. Otherwise, the number of QPUs is the number of work-items in a work-group.
+    const bool groupPerQPU = mergeFactor > 1;
+    if(groupPerQPU && localSize > mergeFactor)
+        return CL_INVALID_WORK_GROUP_SIZE;
+    size_t numQPUs = groupPerQPU ? std::min<size_t>(args.system->getNumQPUs(), numGroups) :
+                                   (localSize / mergeFactor) + (localSize % mergeFactor != 0);
+    if(numQPUs > args.system->getNumQPUs())
+        return CL_INVALID_GLOBAL_WORK_SIZE;
+
+    if(numQPUs == 0)
+        // OpenCL 3.0 requires that we allow to enqueue a kernel without any executions for some reason
+        return CL_COMPLETE;
     std::array<std::size_t, kernel_config::NUM_DIMENSIONS> group_indices = {0, 0, 0};
     std::array<std::size_t, kernel_config::NUM_DIMENSIONS> local_indices = {0, 0, 0};
 
     // if the "loop-work-groups" optimization is enabled, all work-items are executed by the first call
     bool isWorkGroupLoopEnabled = kernel->info.uniformsUsed.getMaxGroupIDXUsed() ||
         kernel->info.uniformsUsed.getMaxGroupIDYUsed() || kernel->info.uniformsUsed.getMaxGroupIDZUsed();
+    // SIMT kernels with work-group loop: every QPU gets one block of UNIFORMs per work-group it runs, each followed by
+    // a flag whether another block follows. So a single launch runs many work-groups.
+    const bool isSIMTGroupLoop = groupPerQPU && kernel->info.uniformsUsed.getNextGroupFlagUsed();
+    const std::size_t uniformsPerGroup =
+        kernel->info.uniformsUsed.countUniforms() + kernel->info.getExplicitUniformCount();
+    const std::size_t groupsPerLaunch = isSIMTGroupLoop ?
+        std::min(numGroups, std::max(numQPUs, MAX_SIMT_UNIFORM_WORDS / uniformsPerGroup)) :
+        1;
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
         std::cout << "Running kernel '" << kernel->info.name << "' with " << kernel->info.getLength()
                   << " instructions..." << std::endl;
         std::cout << "Local sizes: " << args.localSizes[0] << " " << args.localSizes[1] << " " << args.localSizes[2]
-                  << " and merge-factor " << static_cast<unsigned>(mergeFactor) << " -> " << numQPUs << " QPUs" << std::endl;
+                  << " and merge-factor " << static_cast<unsigned>(mergeFactor) << " -> " << numQPUs << " QPUs"
+                  << (groupPerQPU ? " (one work-group per QPU)" : "") << std::endl;
         std::cout << "Global sizes: " << args.globalSizes[0] << " " << args.globalSizes[1] << " " << args.globalSizes[2]
                   << " -> " << (args.globalSizes[0] * args.globalSizes[1] * args.globalSizes[2]) / localSize
-                  << " work-groups (" << (isWorkGroupLoopEnabled ? "all at once" : "separate") << ")" << std::endl;
+                  << " work-groups ("
+                  << (isWorkGroupLoopEnabled ? "all at once" :
+                                               (isSIMTGroupLoop ? "up to " + std::to_string(groupsPerLaunch) +
+                                                           " per launch" :
+                                                                  std::string("separate")))
+                  << ")" << std::endl;
     })
 
     //
     // ALLOCATE BUFFER
     //
     size_t buffer_size = get_size(args.system->getNumQPUs(), kernel->info.getLength() * sizeof(uint64_t),
-        numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
+        isSIMTGroupLoop ? groupsPerLaunch * uniformsPerGroup :
+                          numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
         kernel->program->globalData.size() * sizeof(uint64_t), kernel->program->moduleInfo.getStackFrameSize());
 
     std::unique_ptr<DeviceBuffer> buffer(
@@ -348,15 +385,8 @@ cl_int executeKernel(KernelExecution& args)
         std::cout << "Copied " << kernel->info.getLength() * sizeof(uint64_t)
                   << " bytes of kernel code to device buffer" << std::endl)
 
-    // 2 times (for each UNIFORM block) 16 times (for each possible QPU)
-    std::array<std::array<unsigned*, 16>, 2> uniformPointers;
-    // Build Uniforms
-    const unsigned* qpu_uniform_0 = p;
-    for(unsigned i = 0; i < numQPUs; ++i)
-    {
-        uniformPointers[0][i] = p;
-        p = set_work_item_info(p, args.numDimensions, args.globalOffsets, args.globalSizes, args.localSizes,
-            group_indices, local_indices, global_data, AS_GPU_ADDRESS(p, buffer.get()), kernel->info.uniformsUsed, mergeFactor);
+    // Writes the UNIFORMs for the kernel parameters, returns false for unhandled argument types
+    auto writeParameters = [&](unsigned*& p) -> bool {
         for(unsigned u = 0; u < kernel->info.parameters.size(); ++u)
         {
             auto tmpBufferIt = args.tmpBuffers.find(u);
@@ -407,9 +437,114 @@ cl_int executeKernel(KernelExecution& args)
             else
             {
                 // At this point all argument types should be handled already
-                return CL_INVALID_KERNEL_ARGS;
+                return false;
             }
         }
+        return true;
+    };
+
+    if(isSIMTGroupLoop)
+    {
+        // Two blocks of UNIFORMs and launch messages: one is prepared while the other one is executed
+        std::array<unsigned*, 2> uniformBlocks{p, p + groupsPerLaunch * uniformsPerGroup};
+        p += 2 * groupsPerLaunch * uniformsPerGroup;
+        std::array<unsigned*, 2> launchMessages{p, p + 2 * numQPUs};
+        p += 4 * numQPUs;
+
+        // Writes the UNIFORMs and launch messages for the given number of work-groups, starting at the given linear
+        // group index. QPU q runs the work-groups q, q + n, q + 2n, ... (with n QPUs launched).
+        auto prepareLaunch = [&](unsigned block, std::size_t firstGroup, std::size_t numLaunchGroups,
+                                 std::size_t& launchQPUs) -> bool {
+            launchQPUs = std::min(numQPUs, numLaunchGroups);
+            unsigned* u = uniformBlocks[block];
+            unsigned* msg = launchMessages[block];
+            for(std::size_t q = 0; q < launchQPUs; ++q)
+            {
+                *msg++ = AS_GPU_ADDRESS(u, buffer.get());
+                *msg++ = AS_GPU_ADDRESS(qpu_code, buffer.get());
+                for(std::size_t g = q; g < numLaunchGroups; g += launchQPUs)
+                {
+                    auto linear = firstGroup + g;
+                    std::array<std::size_t, kernel_config::NUM_DIMENSIONS> groupIndices = {linear % group_limits[0],
+                        (linear / group_limits[0]) % group_limits[1], linear / (group_limits[0] * group_limits[1])};
+                    u = set_work_item_info(u, args.numDimensions, args.globalOffsets, args.globalSizes,
+                        args.localSizes, groupIndices, local_indices, global_data, AS_GPU_ADDRESS(u, buffer.get()),
+                        kernel->info.uniformsUsed, mergeFactor);
+                    if(!writeParameters(u))
+                        return false;
+                    *u++ = g + launchQPUs < numLaunchGroups ? 1u : 0u;
+                }
+            }
+            return true;
+        };
+
+        const std::string dumpFile("/tmp/vc4cl-dump-" + kernel->info.name + "-" + std::to_string(rand()) + ".bin");
+        std::ofstream f;
+        std::size_t launchGroups = groupsPerLaunch;
+        std::size_t launchQPUs = 0;
+        unsigned block = 0;
+        if(!prepareLaunch(block, 0, launchGroups, launchQPUs))
+            return CL_INVALID_KERNEL_ARGS;
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
+            std::cout << "Dumping kernel buffer to " << dumpFile << std::endl;
+            f.open(dumpFile, std::ios_base::out | std::ios_base::trunc | std::ios_base::binary);
+            dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformBlocks[0], true);
+        })
+        flushHostCache(*args.system, buffer, args.tmpBuffers, args.persistentBuffers);
+
+        auto timeout = KERNEL_TIMEOUT * std::max(std::size_t{30}, groupsPerLaunch);
+        const auto accessedBuffers = collectBuffers(buffer, args.tmpBuffers, args.persistentBuffers);
+        std::unique_ptr<PerformanceCollector> perfCollector;
+        if(args.performanceCounters)
+            perfCollector.reset(
+                new PerformanceCollector(*args.performanceCounters, args.kernel->info, numQPUs, numGroups));
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Running work-groups 0 to " << (launchGroups - 1) << " on " << launchQPUs << " QPUs"
+                      << std::endl)
+        auto result = args.system->executeQPU(static_cast<unsigned>(launchQPUs),
+            std::make_pair(launchMessages[block], AS_GPU_ADDRESS(launchMessages[block], buffer.get())),
+            accessedBuffers, true, timeout);
+        for(std::size_t nextGroup = launchGroups; nextGroup < numGroups; nextGroup += launchGroups)
+        {
+            block ^= 1u;
+            launchGroups = std::min(groupsPerLaunch, numGroups - nextGroup);
+            // the arguments were already written successfully for the first launch
+            prepareLaunch(block, nextGroup, launchGroups, launchQPUs);
+            // wait for and check previous (possible asynchronous) execution
+            if(!result.waitFor())
+                return CL_OUT_OF_RESOURCES;
+            flushHostCache(*args.system, buffer, {}, {});
+            DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+                std::cout << "Running work-groups " << nextGroup << " to " << (nextGroup + launchGroups - 1)
+                          << " on " << launchQPUs << " QPUs" << std::endl)
+            result = args.system->executeQPU(static_cast<unsigned>(launchQPUs),
+                std::make_pair(launchMessages[block], AS_GPU_ADDRESS(launchMessages[block], buffer.get())),
+                accessedBuffers, false, timeout);
+        }
+        auto status = result.waitFor();
+        perfCollector.reset();
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformBlocks[0], false))
+
+        args.tmpBuffers.clear();
+        args.persistentBuffers.clear();
+        args.executionArguments.clear();
+        return status ? CL_COMPLETE : CL_OUT_OF_RESOURCES;
+    }
+
+    // 2 times (for each UNIFORM block) 16 times (for each possible QPU)
+    std::array<std::array<unsigned*, 16>, 2> uniformPointers;
+    // Build Uniforms
+    const unsigned* qpu_uniform_0 = p;
+    // in SIMT mode, QPU i runs the i-th next work-group
+    auto qpu_group_indices = group_indices;
+    for(unsigned i = 0; i < numQPUs; ++i)
+    {
+        uniformPointers[0][i] = p;
+        p = set_work_item_info(p, args.numDimensions, args.globalOffsets, args.globalSizes, args.localSizes,
+            qpu_group_indices, local_indices, global_data, AS_GPU_ADDRESS(p, buffer.get()), kernel->info.uniformsUsed,
+            mergeFactor);
+        if(!writeParameters(p))
+            return CL_INVALID_KERNEL_ARGS;
         // append UNIFORMs for "loop-work-groups" optimization to end of kernel UNIFORMs
         if(kernel->info.uniformsUsed.getUniformAddressUsed())
             *p++ = AS_GPU_ADDRESS(uniformPointers[0][i], buffer.get());
@@ -420,7 +555,10 @@ cl_int executeKernel(KernelExecution& args)
         if(kernel->info.uniformsUsed.getMaxGroupIDZUsed())
             *p++ = static_cast<unsigned>(group_limits[2]);
 
-        increment_index(local_indices, args.localSizes, 1);
+        if(groupPerQPU)
+            increment_index(qpu_group_indices, group_limits, 1);
+        else
+            increment_index(local_indices, args.localSizes, 1);
     }
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
@@ -493,7 +631,10 @@ cl_int executeKernel(KernelExecution& args)
             group_limits[0] * group_limits[1] * group_limits[2]));
     // on first execution, flush code cache
     auto start = std::chrono::high_resolution_clock::now();
-    auto result = args.system->executeQPU(static_cast<unsigned>(numQPUs),
+    // the number of QPUs (in SIMT mode: of work-groups) run by the current execution
+    size_t launchedQPUs = numQPUs;
+    size_t remainingGroups = numGroups - (groupPerQPU ? numQPUs : 1);
+    auto result = args.system->executeQPU(static_cast<unsigned>(launchedQPUs),
         std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), accessedBuffers, true,
         timeout);
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
@@ -504,20 +645,27 @@ cl_int executeKernel(KernelExecution& args)
                   << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
     })
 
-    while(!isWorkGroupLoopEnabled && increment_index(group_indices, group_limits, 1))
+    while(!isWorkGroupLoopEnabled && remainingGroups > 0 &&
+        advance_index(group_indices, group_limits, groupPerQPU ? launchedQPUs : 1))
     {
         // switch between current and next launch message and UNIFORM blocks
         std::swap(qpu_msg_current, qpu_msg_next);
         std::swap(uniformPointers_current, uniformPointers_next);
         local_indices[0] = local_indices[1] = local_indices[2] = 0;
+        qpu_group_indices = group_indices;
+        launchedQPUs = groupPerQPU ? std::min(numQPUs, remainingGroups) : numQPUs;
+        remainingGroups -= groupPerQPU ? launchedQPUs : 1;
         // re-set indices and offsets for all QPUs
-        for(cl_uint i = 0; i < numQPUs; ++i)
+        for(cl_uint i = 0; i < launchedQPUs; ++i)
         {
             set_work_item_info((*uniformPointers_current)[i], args.numDimensions, args.globalOffsets, args.globalSizes,
-                args.localSizes, group_indices, local_indices, global_data,
+                args.localSizes, qpu_group_indices, local_indices, global_data,
                 AS_GPU_ADDRESS((*uniformPointers_current)[i], buffer.get()), kernel->info.uniformsUsed, mergeFactor);
 
-            increment_index(local_indices, args.localSizes, 1);
+            if(groupPerQPU)
+                increment_index(qpu_group_indices, group_limits, 1);
+            else
+                increment_index(local_indices, args.localSizes, 1);
         }
         // wait for and check previous work-group (possible asynchronous) execution
         if(!result.waitFor())
@@ -527,7 +675,7 @@ cl_int executeKernel(KernelExecution& args)
             std::cout << "Running work-group " << group_indices[0] << ", " << group_indices[1] << ", "
                       << group_indices[2] << std::endl)
         // all following executions, don't flush cache
-        result = args.system->executeQPU(static_cast<unsigned>(numQPUs),
+        result = args.system->executeQPU(static_cast<unsigned>(launchedQPUs),
             std::make_pair(qpu_msg_current, AS_GPU_ADDRESS(qpu_msg_current, buffer.get())), accessedBuffers, false,
             timeout);
         // NOTE: This disables background-execution!

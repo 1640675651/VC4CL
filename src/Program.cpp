@@ -10,6 +10,7 @@
 #include "extensions.h"
 #include "hal/hal.h"
 
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
@@ -80,6 +81,32 @@ static cl_int extractLog(std::string& log, std::wstringstream& logStream)
     return CL_SUCCESS;
 }
 
+/*
+ * Removes the options switching VC4C's SIMT mode on or off (--fsimt, --fno-simt, see VC4C's doc/SIMT.md) from the build
+ * options, since the front-end compiler doesn't know them, and applies them to the given configuration.
+ */
+static std::string extractSIMTOptions(std::string options, vc4c::Configuration& config)
+{
+    for(const std::string flag : {"--fsimt", "--fno-simt"})
+    {
+        std::size_t pos = 0;
+        while((pos = options.find(flag, pos)) != std::string::npos)
+        {
+            auto end = pos + flag.size();
+            bool isWholeOption = (pos == 0 || std::isspace(static_cast<unsigned char>(options[pos - 1]))) &&
+                (end == options.size() || std::isspace(static_cast<unsigned char>(options[end])));
+            if(!isWholeOption)
+            {
+                pos = end;
+                continue;
+            }
+            vc4c::tools::parseConfigurationParameter(config, flag);
+            options.erase(pos, flag.size());
+        }
+    }
+    return options;
+}
+
 static cl_int precompile_program(Program* program, const std::string& options,
     const std::unordered_map<std::string, object_wrapper<Program>>& embeddedHeaders)
 {
@@ -126,7 +153,8 @@ static cl_int precompile_program(Program* program, const std::string& options,
         if(!tempHeaderFiles.empty())
             tempHeaderIncludes = " -I /tmp/ ";
 
-        auto out = vc4c::Precompiler::precompile(sourceCode, config, tempHeaderIncludes + options);
+        auto out = vc4c::Precompiler::precompile(
+            sourceCode, config, tempHeaderIncludes + extractSIMTOptions(options, config));
         if(!out.getRawData(program->intermediateCode))
         {
             std::stringstream tmpStream{};
@@ -268,7 +296,7 @@ static cl_int compile_program(Program* program, const std::string& options)
     {
         vc4c::setLogger(logStream, false, vc4c::LogLevel::WARNING);
 
-        auto result = vc4c::Compiler::compile(intermediateCode, config, options);
+        auto result = vc4c::Compiler::compile(intermediateCode, config, extractSIMTOptions(options, config));
         program->binaryCode.resize(result.second / sizeof(uint64_t), '\0');
         std::vector<uint8_t> rawData;
         if(result.first.getRawData(rawData))
