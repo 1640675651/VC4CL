@@ -55,19 +55,29 @@ void ObjectTracker::addObject(BaseObject* obj)
 
 void ObjectTracker::removeObject(BaseObject* obj)
 {
-    std::lock_guard<std::recursive_mutex> guard(liveObjectsTracker.trackerMutex);
-    DEBUG_LOG(DebugLevel::OBJECTS,
-        std::cout << "Releasing live-time of object: " << obj->getBasePointer() << " (" << obj->typeName << ')'
-                  << std::endl)
-    // TODO since the short-lived objects tend to be located at the end, we should search in reverse direction!
-    auto it = std::find_if(liveObjectsTracker.liveObjects.begin(), liveObjectsTracker.liveObjects.end(),
-        [obj](const std::unique_ptr<BaseObject>& ptr) -> bool { return ptr.get() == obj; });
-    if(it != liveObjectsTracker.liveObjects.end())
-        liveObjectsTracker.liveObjects.erase(it);
-    else
+    std::unique_ptr<BaseObject> removedObject;
+    {
+        std::lock_guard<std::recursive_mutex> guard(liveObjectsTracker.trackerMutex);
         DEBUG_LOG(DebugLevel::OBJECTS,
-            std::cout << "Removing object not previously tracked: " << obj->getBasePointer() << " (" << obj->typeName
-                      << ')' << std::endl)
+            std::cout << "Releasing live-time of object: " << obj->getBasePointer() << " (" << obj->typeName << ')'
+                      << std::endl)
+        // TODO since the short-lived objects tend to be located at the end, we should search in reverse direction!
+        auto it = std::find_if(liveObjectsTracker.liveObjects.begin(), liveObjectsTracker.liveObjects.end(),
+            [obj](const std::unique_ptr<BaseObject>& ptr) -> bool { return ptr.get() == obj; });
+        if(it != liveObjectsTracker.liveObjects.end())
+        {
+            removedObject = std::move(*it);
+            liveObjectsTracker.liveObjects.erase(it);
+        }
+        else
+            DEBUG_LOG(DebugLevel::OBJECTS,
+                std::cout << "Removing object not previously tracked: " << obj->getBasePointer() << " ("
+                          << obj->typeName << ')' << std::endl)
+    }
+    // Destroy the object without holding the lock: its destructor may release other objects, e.g. the last event of a
+    // command queue releases the queue, whose destructor waits for the queue's event thread, which might itself wait
+    // for the lock to release another object (deadlock).
+    removedObject.reset();
 }
 
 void ObjectTracker::iterateObjects(ReportFunction func, void* userData)
