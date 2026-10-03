@@ -277,19 +277,25 @@ cl_int executeKernel(KernelExecution& args)
 
     auto mergeFactor = std::max(kernel->info.workItemMergeFactor, uint8_t{1});
     size_t localSize = args.localSizes[0] * args.localSizes[1] * args.localSizes[2];
-    // Kernels running one work-item per SIMD lane (SIMT mode) run chunks of up to 16 work-items per QPU, independent
-    // of the other QPUs. Otherwise, the number of QPUs is the number of work-items in a work-group.
-    const bool groupPerQPU = mergeFactor > 1;
-    // SIMT kernels with work-group loop: every QPU gets one block of UNIFORMs per chunk it runs, each followed by a flag
-    // whether another block follows. So a single launch runs many chunks, of any work-groups. Without the loop, a QPU
-    // runs a single work-group (of at most 16 work-items) per launch.
-    const bool isSIMTGroupLoop = groupPerQPU && kernel->info.uniformsUsed.getNextGroupFlagUsed();
-    if(groupPerQPU && !isSIMTGroupLoop && localSize > mergeFactor)
+    // Kernels with independent work-items (always in SIMT mode) run chunks of work-items (16 in SIMT mode, otherwise
+    // 1) on any QPU: every QPU gets one block of UNIFORMs per chunk it runs, each followed by a flag whether another
+    // block follows. So a single launch runs many chunks, of any work-groups.
+    const bool hasIndependentWorkItems = kernel->info.uniformsUsed.getNextGroupFlagUsed();
+    // SIMT kernels without that loop run a single work-group (of at most 16 work-items) per QPU and launch. Other
+    // kernels run one work-item per QPU, the number of QPUs is the number of work-items in a work-group.
+    const bool groupPerQPU = mergeFactor > 1 && !hasIndependentWorkItems;
+    if(groupPerQPU && localSize > mergeFactor)
         return CL_INVALID_WORK_GROUP_SIZE;
-    const std::size_t chunksPerGroup = isSIMTGroupLoop ? (localSize + mergeFactor - 1) / mergeFactor : 1;
+    // the chunks of a work-group: SIMT kernels only have 1-dimensional work-groups
+    const std::array<std::size_t, kernel_config::NUM_DIMENSIONS> chunkLimits = {
+        (args.localSizes[0] + mergeFactor - 1) / mergeFactor, args.localSizes[1], args.localSizes[2]};
+    const std::size_t chunksPerGroup =
+        hasIndependentWorkItems ? chunkLimits[0] * chunkLimits[1] * chunkLimits[2] : 1;
     const std::size_t numChunks = numGroups * chunksPerGroup;
-    size_t numQPUs = groupPerQPU ? std::min<size_t>(args.system->getNumQPUs(), numChunks) :
-                                   (localSize / mergeFactor) + (localSize % mergeFactor != 0);
+    size_t numQPUs = hasIndependentWorkItems ?
+        std::min<size_t>(args.system->getNumQPUs(), numChunks) :
+        (groupPerQPU ? std::min<size_t>(args.system->getNumQPUs(), numGroups) :
+                       (localSize / mergeFactor) + (localSize % mergeFactor != 0));
     if(numQPUs > args.system->getNumQPUs())
         return CL_INVALID_GLOBAL_WORK_SIZE;
 
@@ -304,7 +310,7 @@ cl_int executeKernel(KernelExecution& args)
         kernel->info.uniformsUsed.getMaxGroupIDYUsed() || kernel->info.uniformsUsed.getMaxGroupIDZUsed();
     const std::size_t uniformsPerChunk =
         kernel->info.uniformsUsed.countUniforms() + kernel->info.getExplicitUniformCount();
-    const std::size_t chunksPerLaunch = isSIMTGroupLoop ?
+    const std::size_t chunksPerLaunch = hasIndependentWorkItems ?
         std::min(numChunks, std::max(numQPUs, MAX_SIMT_UNIFORM_WORDS / uniformsPerChunk)) :
         1;
 
@@ -313,14 +319,14 @@ cl_int executeKernel(KernelExecution& args)
                   << " instructions..." << std::endl;
         std::cout << "Local sizes: " << args.localSizes[0] << " " << args.localSizes[1] << " " << args.localSizes[2]
                   << " and merge-factor " << static_cast<unsigned>(mergeFactor) << " -> " << numQPUs << " QPUs"
-                  << (isSIMTGroupLoop ? " (" + std::to_string(chunksPerGroup) + " chunks per work-group)" :
+                  << (hasIndependentWorkItems ? " (" + std::to_string(chunksPerGroup) + " chunks per work-group)" :
                                         (groupPerQPU ? std::string(" (one work-group per QPU)") : std::string()))
                   << std::endl;
         std::cout << "Global sizes: " << args.globalSizes[0] << " " << args.globalSizes[1] << " " << args.globalSizes[2]
                   << " -> " << (args.globalSizes[0] * args.globalSizes[1] * args.globalSizes[2]) / localSize
                   << " work-groups ("
                   << (isWorkGroupLoopEnabled ? "all at once" :
-                                               (isSIMTGroupLoop ? "up to " + std::to_string(chunksPerLaunch) +
+                                               (hasIndependentWorkItems ? "up to " + std::to_string(chunksPerLaunch) +
                                                            " chunks per launch" :
                                                                   std::string("separate")))
                   << ")" << std::endl;
@@ -330,7 +336,7 @@ cl_int executeKernel(KernelExecution& args)
     // ALLOCATE BUFFER
     //
     size_t buffer_size = get_size(args.system->getNumQPUs(), kernel->info.getLength() * sizeof(uint64_t),
-        isSIMTGroupLoop ? chunksPerLaunch * uniformsPerChunk :
+        hasIndependentWorkItems ? chunksPerLaunch * uniformsPerChunk :
                           numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
         kernel->program->globalData.size() * sizeof(uint64_t), kernel->program->moduleInfo.getStackFrameSize());
 
@@ -448,7 +454,7 @@ cl_int executeKernel(KernelExecution& args)
         return true;
     };
 
-    if(isSIMTGroupLoop)
+    if(hasIndependentWorkItems)
     {
         // Two blocks of UNIFORMs and launch messages: one is prepared while the other one is executed
         std::array<unsigned*, 2> uniformBlocks{p, p + chunksPerLaunch * uniformsPerChunk};
@@ -456,9 +462,9 @@ cl_int executeKernel(KernelExecution& args)
         std::array<unsigned*, 2> launchMessages{p, p + 2 * numQPUs};
         p += 4 * numQPUs;
 
-        // Writes the UNIFORMs and launch messages for the given number of chunks (of 16 work-items of a work-group),
+        // Writes the UNIFORMs and launch messages for the given number of chunks (of the work-items of a work-group),
         // starting at the given linear chunk index. QPU q runs the chunks q, q + n, q + 2n, ... (with n QPUs launched).
-        // SIMT kernels have no barriers, so the chunks of a work-group don't need to run at the same time.
+        // The work-items are independent, so the chunks of a work-group don't need to run at the same time.
         auto prepareLaunch = [&](unsigned block, std::size_t firstChunk, std::size_t numLaunchChunks,
                                  std::size_t& launchQPUs) -> bool {
             launchQPUs = std::min(numQPUs, numLaunchChunks);
@@ -474,9 +480,11 @@ cl_int executeKernel(KernelExecution& args)
                     auto group = chunk / chunksPerGroup;
                     std::array<std::size_t, kernel_config::NUM_DIMENSIONS> groupIndices = {group % group_limits[0],
                         (group / group_limits[0]) % group_limits[1], group / (group_limits[0] * group_limits[1])};
-                    // the first local ID of the chunk is this times the merge factor
+                    // the local IDs of the chunk's first work-item, the X dimension in multiples of the merge factor
+                    auto chunkInGroup = chunk % chunksPerGroup;
                     std::array<std::size_t, kernel_config::NUM_DIMENSIONS> chunkIndices = {
-                        chunk % chunksPerGroup, 0, 0};
+                        chunkInGroup % chunkLimits[0], (chunkInGroup / chunkLimits[0]) % chunkLimits[1],
+                        chunkInGroup / (chunkLimits[0] * chunkLimits[1])};
                     u = set_work_item_info(u, args.numDimensions, args.globalOffsets, args.globalSizes,
                         args.localSizes, groupIndices, chunkIndices, global_data, AS_GPU_ADDRESS(u, buffer.get()),
                         kernel->info.uniformsUsed, mergeFactor);
@@ -533,7 +541,8 @@ cl_int executeKernel(KernelExecution& args)
         }
         auto status = result.waitFor();
         perfCollector.reset();
-        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformBlocks[0], false))
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformBlocks[0], false))
 
         args.tmpBuffers.clear();
         args.persistentBuffers.clear();

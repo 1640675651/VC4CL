@@ -334,17 +334,20 @@ cl_int Kernel::getInfo(
 }
 
 /*
- * The maximum number of work-items in a work-group of a kernel: one work-item per QPU, or, for kernels running one
- * work-item per SIMD lane (SIMT mode, merge factor > 1), 16 work-items per QPU. With the SIMT work-group loop, the
- * chunks of 16 work-items of a work-group are distributed across all QPUs, otherwise a work-group runs on a single QPU.
+ * The maximum number of work-items in a work-group of a kernel:
+ * - kernels with independent work-items (always in SIMT mode) run chunks of work-items (16 in SIMT mode, otherwise 1)
+ *   on any QPU, one after the other (see executor.cpp), so the work-groups are only limited by the device limit,
+ * - other kernels run one work-item per QPU at the same time, or (SIMT mode without the loop over independent
+ *   work-items) one work-group per QPU.
  */
 static cl_uint getMaxWorkGroupSize(const KernelHeader& info)
 {
-    if(info.workItemMergeFactor <= 1)
-        return system()->getNumQPUs();
+    auto numQPUs = system()->getNumQPUs();
     if(info.uniformsUsed.getNextGroupFlagUsed())
-        return system()->getNumQPUs() * info.workItemMergeFactor;
-    return info.workItemMergeFactor;
+        return isSIMTMode() ? numQPUs * static_cast<cl_uint>(SIMT_WORK_ITEMS_PER_QPU) : numQPUs;
+    if(info.workItemMergeFactor > 1)
+        return info.workItemMergeFactor;
+    return numQPUs;
 }
 
 cl_int Kernel::getWorkGroupInfo(
@@ -467,7 +470,8 @@ static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NU
  * - the number of work-groups is as small as possible
  */
 static cl_int split_global_work_size(const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& global_sizes,
-    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, cl_uint num_dimensions, const KernelHeader& info)
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, cl_uint num_dimensions,
+    const KernelHeader& info)
 {
     const size_t total_sizes = global_sizes[0] * global_sizes[1] * global_sizes[2];
     const cl_uint max_group_size = getMaxWorkGroupSize(info);

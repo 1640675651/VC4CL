@@ -53,11 +53,11 @@ cl_int Device::getInfo(
         //"Maximum number of work-items that can be specified in each dimension of the work-group.
         // Returns n size_t entries, where n is the value returned by the query for CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS.
         // The minimum value is (1, 1, 1)."
-        size_t numQPUs = system()->getNumQPUs();
-        // In SIMT mode, 1-dimensional work-groups run 16 work-items per QPU, on up to all QPUs. Kernels which can't
-        // run in SIMT mode report their lower limit via CL_KERNEL_WORK_GROUP_SIZE.
-        std::array<size_t, kernel_config::NUM_DIMENSIONS> tmp{
-            isSIMTMode() ? numQPUs * SIMT_WORK_ITEMS_PER_QPU : numQPUs, numQPUs, numQPUs};
+        // In SIMT mode, work-groups of kernels with independent work-items run in chunks on any QPU: 16 work-items per
+        // QPU in SIMT mode (1-dimensional work-groups only), otherwise 1 work-item, in any dimension. Kernels with
+        // barriers or __local memory report their lower limit via CL_KERNEL_WORK_GROUP_SIZE.
+        size_t maxSize = system()->getNumQPUs() * (isSIMTMode() ? SIMT_WORK_ITEMS_PER_QPU : 1u);
+        std::array<size_t, kernel_config::NUM_DIMENSIONS> tmp{maxSize, maxSize, maxSize};
         return returnValue(tmp.data(), sizeof(size_t), tmp.size(), param_value_size, param_value, param_value_size_ret);
     }
     case CL_DEVICE_MAX_WORK_GROUP_SIZE:
