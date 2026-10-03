@@ -296,7 +296,11 @@ static cl_int compile_program(Program* program, const std::string& options)
     {
         vc4c::setLogger(logStream, false, vc4c::LogLevel::WARNING);
 
-        auto result = vc4c::Compiler::compile(intermediateCode, config, extractSIMTOptions(options, config));
+        auto compileOptions = extractSIMTOptions(options, config);
+        if(!isSIMTMode())
+            // the device limits don't allow the work-group sizes of SIMT kernels
+            vc4c::tools::parseConfigurationParameter(config, "--fno-simt");
+        auto result = vc4c::Compiler::compile(intermediateCode, config, compileOptions);
         program->binaryCode.resize(result.second / sizeof(uint64_t), '\0');
         std::vector<uint8_t> rawData;
         if(result.first.getRawData(rawData))

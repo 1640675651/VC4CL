@@ -335,11 +335,16 @@ cl_int Kernel::getInfo(
 
 /*
  * The maximum number of work-items in a work-group of a kernel: one work-item per QPU, or, for kernels running one
- * work-item per SIMD lane (SIMT mode, merge factor > 1), the work-items of a single QPU.
+ * work-item per SIMD lane (SIMT mode, merge factor > 1), 16 work-items per QPU. With the SIMT work-group loop, the
+ * chunks of 16 work-items of a work-group are distributed across all QPUs, otherwise a work-group runs on a single QPU.
  */
-static cl_uint getMaxWorkGroupSize(uint8_t mergeFactor)
+static cl_uint getMaxWorkGroupSize(const KernelHeader& info)
 {
-    return mergeFactor > 1 ? mergeFactor : system()->getNumQPUs();
+    if(info.workItemMergeFactor <= 1)
+        return system()->getNumQPUs();
+    if(info.uniformsUsed.getNextGroupFlagUsed())
+        return system()->getNumQPUs() * info.workItemMergeFactor;
+    return info.workItemMergeFactor;
 }
 
 cl_int Kernel::getWorkGroupInfo(
@@ -355,7 +360,7 @@ cl_int Kernel::getWorkGroupInfo(
     {
         //"[...] query the maximum work-group size that can be used to execute a kernel on a specific device [...]"
         return returnValue<size_t>(
-            getMaxWorkGroupSize(info.workItemMergeFactor), param_value_size, param_value, param_value_size_ret);
+            getMaxWorkGroupSize(info), param_value_size, param_value, param_value_size_ret);
     }
     case CL_KERNEL_COMPILE_WORK_GROUP_SIZE:
     {
@@ -370,8 +375,7 @@ cl_int Kernel::getWorkGroupInfo(
                 param_value, param_value_size_ret);
         return returnValue<cl_ulong>(0, param_value_size, param_value, param_value_size_ret);
     case CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE:
-        // TODO this has little effect (and is in fact wrong according to the OpenCL standard), if clients check the
-        // device's max work-group size (which is fixed to 12)...
+        // SIMT kernels: a multiple of 16 work-items fills all SIMD lanes
         return returnValue<size_t>(info.workItemMergeFactor ? info.workItemMergeFactor : 1u, param_value_size,
             param_value, param_value_size_ret);
     case CL_KERNEL_PRIVATE_MEM_SIZE:
@@ -434,12 +438,12 @@ cl_int Kernel::getArgInfo(cl_uint arg_index, cl_kernel_arg_info param_name, size
  */
 static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NUM_DIMENSIONS>& compile_group_sizes,
     const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& global_sizes,
-    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, uint8_t mergeFactor)
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, const KernelHeader& info)
 {
     if(compile_group_sizes[0] == 0 && compile_group_sizes[1] == 0 && compile_group_sizes[2] == 0)
         // no compile-time sizes set
         return false;
-    const cl_uint max_group_size = getMaxWorkGroupSize(mergeFactor);
+    const cl_uint max_group_size = getMaxWorkGroupSize(info);
 
     if((global_sizes[0] % compile_group_sizes[0]) != 0 || (global_sizes[1] % compile_group_sizes[1]) != 0 ||
         (global_sizes[2] % compile_group_sizes[2]) != 0)
@@ -463,12 +467,13 @@ static bool split_compile_work_size(const std::array<uint16_t, kernel_config::NU
  * - the number of work-groups is as small as possible
  */
 static cl_int split_global_work_size(const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& global_sizes,
-    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, cl_uint num_dimensions, uint8_t mergeFactor)
+    std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& local_sizes, cl_uint num_dimensions, const KernelHeader& info)
 {
     const size_t total_sizes = global_sizes[0] * global_sizes[1] * global_sizes[2];
-    const cl_uint max_group_size = getMaxWorkGroupSize(mergeFactor);
+    const cl_uint max_group_size = getMaxWorkGroupSize(info);
     // SIMT kernels only support 1-dimensional work-groups
-    if(total_sizes <= max_group_size && (mergeFactor <= 1 || (global_sizes[1] == 1 && global_sizes[2] == 1)))
+    if(total_sizes <= max_group_size &&
+        (info.workItemMergeFactor <= 1 || (global_sizes[1] == 1 && global_sizes[2] == 1)))
     {
         // can be executed in a single work-group
         local_sizes[0] = global_sizes[0];
@@ -574,9 +579,9 @@ cl_int Kernel::setWorkGroupSizes(CommandQueue* commandQueue, cl_uint work_dim, c
         //"local_work_size can also be a NULL value in which case the OpenCL implementation
         // will determine how to be break the global work-items into appropriate work-group instances."
         cl_int state = CL_SUCCESS;
-        if(!split_compile_work_size(info.workGroupSize, work_sizes, local_sizes, mergeFactor))
+        if(!split_compile_work_size(info.workGroupSize, work_sizes, local_sizes, info))
         {
-            state = split_global_work_size(work_sizes, local_sizes, work_dim, mergeFactor);
+            state = split_global_work_size(work_sizes, local_sizes, work_dim, info);
         }
 
         if(state != CL_SUCCESS)
@@ -617,10 +622,10 @@ cl_int Kernel::setWorkGroupSizes(CommandQueue* commandQueue, cl_uint work_dim, c
                 work_sizes[1] + work_offsets[1], kernel_config::MAX_WORK_ITEM_DIMENSIONS[1],
                 work_sizes[2] + work_offsets[2], kernel_config::MAX_WORK_ITEM_DIMENSIONS[2]));
     }
-    if(exceedsLimits<size_t>(local_sizes[0] * local_sizes[1] * local_sizes[2], 0, getMaxWorkGroupSize(mergeFactor)))
+    if(exceedsLimits<size_t>(local_sizes[0] * local_sizes[1] * local_sizes[2], 0, getMaxWorkGroupSize(info)))
         return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
             buildString("Local work-sizes exceed maximum: %u * %u * %u > %u", local_sizes[0], local_sizes[1],
-                local_sizes[2], getMaxWorkGroupSize(mergeFactor)));
+                local_sizes[2], getMaxWorkGroupSize(info)));
     if(mergeFactor > 1 && (local_sizes[1] != 1 || local_sizes[2] != 1))
         return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
             buildString("Kernels running one work-item per SIMD lane only support 1-dimensional work-groups: %u * %u "

@@ -153,6 +153,12 @@ static DebugLevel getDebugLevel()
     return static_cast<DebugLevel>(level);
 }
 
+bool vc4cl::isSIMTMode()
+{
+    static const bool simtMode = std::getenv("VC4CL_NO_SIMT") == nullptr;
+    return simtMode;
+}
+
 bool vc4cl::isDebugModeEnabled(DebugLevel level)
 {
     using IntType = std::underlying_type<DebugLevel>::type;

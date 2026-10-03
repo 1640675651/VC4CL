@@ -68,6 +68,16 @@ namespace vc4cl
 
     bool isDebugModeEnabled(DebugLevel level);
 
+    /*
+     * Whether kernels run with one work-item per SIMD lane where possible (SIMT mode, the default), or always with one
+     * work-item per QPU (classic mode, selected with the VC4CL_NO_SIMT environment variable). Fixed for the process,
+     * since it determines the device's work-group size limits. See VC4C's doc/SIMT.md.
+     */
+    bool isSIMTMode();
+
+    // The number of work-items a QPU runs in SIMT mode: one per SIMD lane
+    static constexpr std::size_t SIMT_WORK_ITEMS_PER_QPU = 16;
+
     CHECK_RETURN std::string joinStrings(const std::vector<std::string>& strings, const std::string& delim = " ");
 
     template <typename T, typename Func = std::function<std::string(const T&)>>

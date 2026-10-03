@@ -54,13 +54,19 @@ cl_int Device::getInfo(
         // Returns n size_t entries, where n is the value returned by the query for CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS.
         // The minimum value is (1, 1, 1)."
         size_t numQPUs = system()->getNumQPUs();
-        std::array<size_t, kernel_config::NUM_DIMENSIONS> tmp{numQPUs, numQPUs, numQPUs};
+        // In SIMT mode, 1-dimensional work-groups run 16 work-items per QPU, on up to all QPUs. Kernels which can't
+        // run in SIMT mode report their lower limit via CL_KERNEL_WORK_GROUP_SIZE.
+        std::array<size_t, kernel_config::NUM_DIMENSIONS> tmp{
+            isSIMTMode() ? numQPUs * SIMT_WORK_ITEMS_PER_QPU : numQPUs, numQPUs, numQPUs};
         return returnValue(tmp.data(), sizeof(size_t), tmp.size(), param_value_size, param_value, param_value_size_ret);
     }
     case CL_DEVICE_MAX_WORK_GROUP_SIZE:
         //"Maximum number of work-items in a work-group executing a kernel on a single compute unit, using the data
         // parallel execution model."
-        return returnValue<size_t>(system()->getNumQPUs(), param_value_size, param_value, param_value_size_ret);
+        // see CL_DEVICE_MAX_WORK_ITEM_SIZES
+        return returnValue<size_t>(
+            system()->getNumQPUs() * (isSIMTMode() ? SIMT_WORK_ITEMS_PER_QPU : 1u), param_value_size, param_value,
+            param_value_size_ret);
     case CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR:
         //"Preferred native vector width size for built-in scalar types that can be put into vectors.
         // The vector width is defined as the number of scalar elements that can be stored in the vector. "
