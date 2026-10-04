@@ -197,18 +197,36 @@ cl_int Buffer::enqueueWrite(CommandQueue* commandQueue, bool blockingWrite, size
     return e->setAsResultOrRelease(errcode, event);
 }
 
-static size_t calculate_offset(const size_t* origin, size_t row_pitch, size_t slice_pitch)
+/*
+ * Applies the default pitches of a rectangular region and checks them, as specified for clEnqueueReadBufferRect,
+ * clEnqueueWriteBufferRect and clEnqueueCopyBufferRect (OpenCL 1.2 specification, pages 72 - 74 and 82):
+ * "If buffer_row_pitch is 0, buffer_row_pitch is computed as region[0]."
+ * "If buffer_slice_pitch is 0, buffer_slice_pitch is computed as region[1] * buffer_row_pitch."
+ * "CL_INVALID_VALUE if buffer_row_pitch is not 0 and is less than region[0]. [...] if buffer_slice_pitch is not 0
+ * and is less than region[1] * buffer_row_pitch or if buffer_slice_pitch is not 0 and is not a multiple of
+ * buffer_row_pitch."
+ */
+static bool apply_default_pitches(const size_t* region, size_t& row_pitch, size_t& slice_pitch)
 {
-    // as specified in OpenCL 1.2 specification, page 82
-    return origin[2] * slice_pitch + origin[1] * row_pitch + origin[0];
+    if(row_pitch == 0)
+        row_pitch = region[0];
+    if(slice_pitch == 0)
+        slice_pitch = region[1] * row_pitch;
+    return row_pitch >= region[0] && slice_pitch >= region[1] * row_pitch && slice_pitch % row_pitch == 0;
 }
 
 /*
- * NOTE: The value returned here is wrong for rectangular access, but can server as quick in-bounds check
+ * The offset after the last byte of a rectangular region (with non-zero sizes), to check whether it is in bounds:
+ * the byte offset of (x, y, z) is "z * slice_pitch + y * row_pitch + x" (OpenCL 1.2 specification, page 82).
  */
-static size_t calculate_size_bounds(const size_t* region)
+static size_t calculate_end_offset(const size_t* origin, const size_t* region, size_t row_pitch, size_t slice_pitch)
 {
-    return region[0] /* width (in bytes) */ * region[1] /* height (in rows) */ * region[2] /* depth (in slices) */;
+    return (origin[2] + region[2] - 1) * slice_pitch + (origin[1] + region[1] - 1) * row_pitch + origin[0] + region[0];
+}
+
+static bool is_empty_region(const size_t* region)
+{
+    return region[0] == 0 || region[1] == 0 || region[2] == 0;
 }
 
 cl_int Buffer::enqueueReadRect(CommandQueue* commandQueue, bool blocking_read, const size_t* buffer_origin,
@@ -223,12 +241,15 @@ cl_int Buffer::enqueueReadRect(CommandQueue* commandQueue, bool blocking_read, c
     if(region == nullptr)
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Region pointer in NULL");
 
-    // only used for range-checks
-    const size_t buffer_offset = calculate_offset(buffer_origin, buffer_row_pitch, buffer_slice_pitch);
-    const size_t size = calculate_size_bounds(region);
-
-    if(size == 0 || buffer_offset + size > hostSize)
-        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, buildString("Invalid read size (%u)!", size));
+    if(is_empty_region(region))
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Empty region to read!");
+    if(!apply_default_pitches(region, buffer_row_pitch, buffer_slice_pitch) ||
+        !apply_default_pitches(region, host_row_pitch, host_slice_pitch))
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__,
+            buildString("Invalid pitches (buffer %u and %u, host %u and %u)!", buffer_row_pitch, buffer_slice_pitch,
+                host_row_pitch, host_slice_pitch));
+    if(calculate_end_offset(buffer_origin, region, buffer_row_pitch, buffer_slice_pitch) > hostSize)
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Region to read is out of bounds!");
     if(ptr == nullptr)
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Read destination pointer in NULL");
 
@@ -278,12 +299,15 @@ cl_int Buffer::enqueueWriteRect(CommandQueue* commandQueue, bool blocking_write,
     if(region == nullptr)
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Region pointer in NULL");
 
-    // only used for range-checks
-    const size_t buffer_offset = calculate_offset(buffer_origin, buffer_row_pitch, buffer_slice_pitch);
-    const size_t size = calculate_size_bounds(region);
-
-    if(size == 0 || buffer_offset + size > hostSize || ptr == nullptr)
-        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, buildString("Invalid write size (%u)!", size));
+    if(is_empty_region(region) || ptr == nullptr)
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Empty region or no source to write!");
+    if(!apply_default_pitches(region, buffer_row_pitch, buffer_slice_pitch) ||
+        !apply_default_pitches(region, host_row_pitch, host_slice_pitch))
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__,
+            buildString("Invalid pitches (buffer %u and %u, host %u and %u)!", buffer_row_pitch, buffer_slice_pitch,
+                host_row_pitch, host_slice_pitch));
+    if(calculate_end_offset(buffer_origin, region, buffer_row_pitch, buffer_slice_pitch) > hostSize)
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Region to write is out of bounds!");
     if(!hostWriteable)
         return returnError(CL_INVALID_OPERATION, __FILE__, __LINE__, "Cannot write to non-writeable buffer");
 
@@ -378,8 +402,13 @@ cl_int Buffer::enqueueCopyInto(CommandQueue* commandQueue, Buffer* destination, 
  * TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE MATERIALS OR THE USE OR OTHER DEALINGS IN THE
  * MATERIALS.
  */
+/*
+ * NOTE: The checks after the first one (regions wrapping around rows or slices) assume that the pitches describe the
+ * layout of the buffer. If the caller left the pitches to be computed from the region, they don't (OpenCL-CTS checks
+ * these cases with the buffer's actual row and slice size), so only the 3-dimensional regions are compared then.
+ */
 static bool check_copy_overlap(const size_t src_offset[3], const size_t dst_offset[3], const size_t region[3],
-    size_t row_pitch, size_t slice_pitch)
+    size_t row_pitch, size_t slice_pitch, bool pitchesGiven)
 {
     const size_t src_min[] = {src_offset[0], src_offset[1], src_offset[2]};
     const size_t src_max[] = {src_offset[0] + region[0], src_offset[1] + region[1], src_offset[2] + region[2]};
@@ -396,7 +425,7 @@ static bool check_copy_overlap(const size_t src_offset[3], const size_t dst_offs
     size_t dst_end = dst_start + (region[2] * slice_pitch + region[1] * row_pitch + region[0]);
     size_t src_start = src_offset[2] * slice_pitch + src_offset[1] * row_pitch + src_offset[0];
     size_t src_end = src_start + (region[2] * slice_pitch + region[1] * row_pitch + region[0]);
-    if(!overlap)
+    if(!overlap && pitchesGiven)
     {
         size_t delta_src_x = (src_offset[0] + region[0] > row_pitch) ? src_offset[0] + region[0] - row_pitch : 0;
         size_t delta_dst_x = (dst_offset[0] + region[0] > row_pitch) ? dst_offset[0] + region[0] - row_pitch : 0;
@@ -432,38 +461,19 @@ cl_int Buffer::enqueueCopyIntoRect(CommandQueue* commandQueue, Buffer* destinati
     if(region == nullptr)
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Region pointer in NULL");
 
-    // only used for range-checks
-    const size_t src_offset = calculate_offset(src_origin, src_row_pitch, src_slice_pitch);
-    const size_t size = calculate_size_bounds(region);
-    const size_t dst_offset = calculate_offset(dst_origin, dst_row_pitch, dst_slice_pitch);
-
-    if(size == 0 || src_offset + size > hostSize || dst_offset + size > destination->hostSize)
-        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, buildString("Invalid copy size (%u)!", size));
-    if(src_row_pitch == 0)
-        // "If src_row_pitch is 0, src_row_pitch is computed as region[0]."
-        src_row_pitch = region[0];
-    if(src_slice_pitch == 0)
-        // "If src_slice_pitch is 0, src_slice_pitch is computed as region[1] * src_row_pitch.""
-        src_slice_pitch = region[1] * src_row_pitch;
-    if(dst_row_pitch == 0)
-        // "If dst_row_pitch is 0, dst_row_pitch is computed as region[0]."
-        dst_row_pitch = region[0];
-    if(dst_slice_pitch == 0)
-        // "If dst_slice_pitch is 0, dst_slice_pitch is computed as region[1] * dst_row_pitch."
-        dst_slice_pitch = region[1] * dst_row_pitch;
-    if(src_row_pitch < region[0] || (src_slice_pitch < region[1] * src_row_pitch) ||
-        (src_slice_pitch % src_row_pitch != 0))
-        // "CL_INVALID_VALUE if src_row_pitch is not 0 and is less than region[0]. [...] if src_slice_pitch is not 0 and
-        // is less than region[1] * src_row_pitch or if src_slice_pitch is not 0 and is not a multiple of
-        // src_row_pitch."
+    if(is_empty_region(region))
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Empty region to copy!");
+    // for the same buffer, the source and destination pitches need to be the same
+    const bool pitchesGiven = src_row_pitch != 0 && src_slice_pitch != 0;
+    if(!apply_default_pitches(region, src_row_pitch, src_slice_pitch))
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__,
             buildString("Invalid source pitches (%u and %u)!", src_row_pitch, src_slice_pitch));
-    if(dst_row_pitch < region[0] || (dst_slice_pitch < region[1] * dst_row_pitch) ||
-        (dst_slice_pitch % dst_row_pitch != 0))
-        // "CL_INVALID_VALUE if dst_row_pitch is not 0 and is less than region[0]. [...] if dst_slice_pitch is not 0 and
-        // is less than region[1] * dst_row_pitch or if dst_slice_pitch is not 0 and is not a multiple of dst_row_pitch.
+    if(!apply_default_pitches(region, dst_row_pitch, dst_slice_pitch))
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__,
             buildString("Invalid destination pitches (%u and %u)!", dst_row_pitch, dst_slice_pitch));
+    if(calculate_end_offset(src_origin, region, src_row_pitch, src_slice_pitch) > hostSize ||
+        calculate_end_offset(dst_origin, region, dst_row_pitch, dst_slice_pitch) > destination->hostSize)
+        return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Region to copy is out of bounds!");
     if(this == destination && src_slice_pitch != dst_slice_pitch)
         // "If src_buffer and dst_buffer are the same buffer object, src_row_pitch must equal dst_row_pitch and
         // src_slice_pitch must equal dst_slice_pitch."
@@ -488,7 +498,7 @@ cl_int Buffer::enqueueCopyIntoRect(CommandQueue* commandQueue, Buffer* destinati
          */
         // TODO does not handle subbuffers of same parent. Also specification does not say anything about subbuffer +
         // parent buffer!
-        if(check_copy_overlap(src_origin, dst_origin, region, src_row_pitch, src_slice_pitch))
+        if(check_copy_overlap(src_origin, dst_origin, region, src_row_pitch, src_slice_pitch, pitchesGiven))
             return returnError(CL_MEM_COPY_OVERLAP, __FILE__, __LINE__, "Source and destination regions overlap!");
     }
 
