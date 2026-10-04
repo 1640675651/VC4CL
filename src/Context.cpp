@@ -8,6 +8,8 @@
 #include "extensions.h"
 #include "hal/hal.h"
 
+#include <algorithm>
+
 using namespace vc4cl;
 
 Context::Context(const Device* device, const Platform* platform,
@@ -167,8 +169,14 @@ cl_context VC4CL_FUNC(clCreateContext)(const cl_context_properties* properties, 
     if(properties != nullptr)
     {
         const cl_context_properties* ptr = properties;
+        std::vector<cl_context_properties> propertyNames;
         while(*ptr != 0)
         {
+            //"CL_INVALID_PROPERTY if [...] the same property name is specified more than once."
+            if(std::find(propertyNames.begin(), propertyNames.end(), *ptr) != propertyNames.end())
+                return returnError<cl_context>(CL_INVALID_PROPERTY, errcode_ret, __FILE__, __LINE__,
+                    buildString("Context property %d is specified more than once!", static_cast<int>(*ptr)));
+            propertyNames.push_back(*ptr);
             if(*ptr == CL_CONTEXT_PLATFORM)
             {
                 ++ptr;
@@ -178,6 +186,10 @@ cl_context VC4CL_FUNC(clCreateContext)(const cl_context_properties* properties, 
             else if(*ptr == CL_CONTEXT_INTEROP_USER_SYNC)
             {
                 ++ptr;
+                //"CL_INVALID_PROPERTY if [...] the value specified for a supported property name is not valid"
+                if(*ptr != CL_TRUE && *ptr != CL_FALSE)
+                    return returnError<cl_context>(CL_INVALID_PROPERTY, errcode_ret, __FILE__, __LINE__,
+                        buildString("Invalid value for CL_CONTEXT_INTEROP_USER_SYNC: %d", static_cast<int>(*ptr)));
                 ++ptr;
             }
             else if(*ptr == CL_CONTEXT_MEMORY_INITIALIZE_KHR)

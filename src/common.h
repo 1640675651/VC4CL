@@ -232,12 +232,18 @@ namespace vc4cl
 #define CHECK_EVENT_ERROR_CODE(event, errcode_ret, type)                                                               \
     CHECK_OBJECT_ERROR_CODE(event, CL_INVALID_EVENT, errcode_ret, type)
 
+    /*
+     * Whether the event wait list matches the number of events and only contains valid events (see Event.cpp).
+     * Whether the events belong to the context of the command queue is checked when they are enqueued.
+     */
+    bool isValidEventWaitList(const cl_event* eventWaitList, cl_uint numEvents);
+
 #define CHECK_EVENT_WAIT_LIST(event_wait_list, num_events_in_wait_list)                                                \
-    if(((event_wait_list) == nullptr) != ((num_events_in_wait_list) == 0))                                             \
-        return returnError(                                                                                            \
-            CL_INVALID_EVENT_WAIT_LIST, __FILE__, __LINE__, "Event list does not match the number of elements!");
+    if(!isValidEventWaitList((event_wait_list), (num_events_in_wait_list)))                                            \
+        return returnError(CL_INVALID_EVENT_WAIT_LIST, __FILE__, __LINE__,                                             \
+            "Event list does not match the number of elements or contains invalid events!");
 #define CHECK_EVENT_WAIT_LIST_ERROR_CODE(event_wait_list, num_events_in_wait_list, errcode_ret, type)                  \
-    if(((event_wait_list) == nullptr) != ((num_events_in_wait_list) == 0))                                             \
+    if(!isValidEventWaitList((event_wait_list), (num_events_in_wait_list)))                                            \
         return returnError<type>(                                                                                      \
             CL_INVALID_EVENT_WAIT_LIST, errcode_ret, __FILE__, __LINE__, "Event list validity check failed!");
 

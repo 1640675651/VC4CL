@@ -97,6 +97,14 @@ cl_int CommandQueue::enqueueEvent(Event* event)
             buildString("Event has already finished with status: %d", event->getStatus()));
     if(!event->action)
         return CL_INVALID_EVENT;
+    for(const auto& waitEvent : event->waitList)
+    {
+        //"CL_INVALID_CONTEXT if context associated with command_queue and events in event_wait_list are not the
+        // same." Otherwise, e.g. a user event of another context would block the queue forever.
+        if(waitEvent && waitEvent->context() != context())
+            return returnError(CL_INVALID_CONTEXT, __FILE__, __LINE__,
+                "The context of an event in the wait list does not match the context of the command-queue!");
+    }
 
     cl_int status = event->prepareToQueue(this);
 
@@ -177,6 +185,16 @@ cl_command_queue VC4CL_FUNC(clCreateCommandQueue)(
     if(toType<Context>(context)->device != toType<Device>(device))
         return returnError<cl_command_queue>(
             CL_INVALID_DEVICE, errcode_ret, __FILE__, __LINE__, "Device of context does not match given device!");
+    //"CL_INVALID_VALUE if values specified in properties are not valid."
+    if((properties & ~static_cast<cl_command_queue_properties>(
+                         CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE | CL_QUEUE_PROFILING_ENABLE)) != 0)
+        return returnError<cl_command_queue>(CL_INVALID_VALUE, errcode_ret, __FILE__, __LINE__,
+            buildString("Invalid command-queue properties: %llu", static_cast<unsigned long long>(properties)));
+    //"CL_INVALID_QUEUE_PROPERTIES if values specified in properties are valid but are not supported by the device."
+    // CL_DEVICE_QUEUE_PROPERTIES reports only profiling as supported
+    if((properties & CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE) != 0)
+        return returnError<cl_command_queue>(CL_INVALID_QUEUE_PROPERTIES, errcode_ret, __FILE__, __LINE__,
+            "Out-of-order execution is not supported by the device");
 
     //"Determines whether the commands queued in the command-queue are executed in-order or out-of-order.
     // If set, the commands in the command-queue are executed out-of-order.
@@ -247,9 +265,10 @@ cl_command_queue VC4CL_FUNC(clCreateCommandQueueWithPropertiesKHR)(
                 ++prop;
             }
             else
-                // any other property is not supported
-                return returnError<cl_command_queue>(CL_INVALID_QUEUE_PROPERTIES, errcode_ret, __FILE__, __LINE__,
-                    "Unsupported command-queue properties");
+                //"CL_INVALID_VALUE if values specified in properties are not valid."
+                // the other properties (CL_QUEUE_SIZE) are for device queues, which are not supported
+                return returnError<cl_command_queue>(CL_INVALID_VALUE, errcode_ret, __FILE__, __LINE__,
+                    buildString("Invalid command-queue property: %llu", static_cast<unsigned long long>(*prop)));
         }
     }
 

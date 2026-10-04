@@ -226,6 +226,21 @@ cl_int Event::prepareToQueue(CommandQueue* queue)
     return CL_SUCCESS;
 }
 
+bool vc4cl::isValidEventWaitList(const cl_event* eventWaitList, cl_uint numEvents)
+{
+    //"CL_INVALID_EVENT_WAIT_LIST if event_wait_list is NULL and num_events_in_wait_list > 0, or event_wait_list is not
+    // NULL and num_events_in_wait_list is 0, or if event objects in event_wait_list are not valid events."
+    if((eventWaitList == nullptr) != (numEvents == 0))
+        return false;
+    for(cl_uint i = 0; i < numEvents; ++i)
+    {
+        auto event = toType<Event>(eventWaitList[i]);
+        if(event == nullptr || !event->checkReferences())
+            return false;
+    }
+    return true;
+}
+
 void Event::setEventWaitList(cl_uint numEvents, const cl_event* events)
 {
     waitList.reserve(numEvents);
