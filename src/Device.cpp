@@ -127,6 +127,21 @@ cl_int Device::getInfo(
 #else
         return returnValue<cl_bool>(CL_FALSE, param_value_size, param_value, param_value_size_ret);
 #endif
+#ifndef IMAGE_SUPPORT
+    case CL_DEVICE_MAX_READ_IMAGE_ARGS:
+    case CL_DEVICE_MAX_WRITE_IMAGE_ARGS:
+    case CL_DEVICE_MAX_SAMPLERS:
+        // Without image support, all image limits are 0 (checked by OpenCL-CTS)
+        return returnValue<cl_uint>(0, param_value_size, param_value, param_value_size_ret);
+    case CL_DEVICE_IMAGE2D_MAX_WIDTH:
+    case CL_DEVICE_IMAGE2D_MAX_HEIGHT:
+    case CL_DEVICE_IMAGE3D_MAX_WIDTH:
+    case CL_DEVICE_IMAGE3D_MAX_HEIGHT:
+    case CL_DEVICE_IMAGE3D_MAX_DEPTH:
+    case CL_DEVICE_IMAGE_MAX_BUFFER_SIZE:
+    case CL_DEVICE_IMAGE_MAX_ARRAY_SIZE:
+        return returnValue<size_t>(0, param_value_size, param_value, param_value_size_ret);
+#else
     case CL_DEVICE_MAX_READ_IMAGE_ARGS:
         //"Max number of simultaneous image objects that can be read by a kernel."
         return returnValue<cl_uint>(
@@ -167,6 +182,7 @@ cl_int Device::getInfo(
         //"Maximum number of samplers that can be used in a kernel."
         return returnValue<cl_uint>(
             kernel_config::MAX_PARAMETER_COUNT / 2, param_value_size, param_value, param_value_size_ret);
+#endif
     case CL_DEVICE_MAX_PARAMETER_SIZE:
         //"Max size in bytes of the arguments that can be passed to a kernel. The minimum value is 1024 (256 for
         // EMBEDDED PROFILE)."
@@ -240,8 +256,10 @@ cl_int Device::getInfo(
         return returnValue<cl_device_local_mem_type>(CL_GLOBAL, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_LOCAL_MEM_SIZE:
         //"Size of local memory arena in bytes.  The minimum value is 32 KB (1KB for EMBEDDED PROFILE)"
-        return returnValue<cl_ulong>(
-            system()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+        // __local memory is allocated in RAM, so any size could be used. But programs allocate up to this size (e.g.
+        // OpenCL-CTS also as a buffer), which fails for the whole GPU memory. 32 KB is the FULL PROFILE minimum.
+        return returnValue<cl_ulong>(kernel_config::MAX_LOCAL_MEMORY_SIZE, param_value_size, param_value,
+            param_value_size_ret);
     case CL_DEVICE_ERROR_CORRECTION_SUPPORT:
         // Is CL_TRUE if the device implements error correction for all accesses to compute device memory (global and
         // constant)"
@@ -604,6 +622,13 @@ cl_int VC4CL_FUNC(clGetDeviceIDs)(cl_platform_id platform, cl_device_type device
             return returnError(CL_INVALID_VALUE, __FILE__, __LINE__, "Cannot retrieve 0 devices!");
         }
     }
+
+    //"CL_INVALID_DEVICE_TYPE if device_type is not a valid value."
+    const cl_device_type validTypes = CL_DEVICE_TYPE_DEFAULT | CL_DEVICE_TYPE_CPU | CL_DEVICE_TYPE_GPU |
+        CL_DEVICE_TYPE_ACCELERATOR | CL_DEVICE_TYPE_CUSTOM;
+    if(device_type == 0 || (device_type != CL_DEVICE_TYPE_ALL && (device_type & ~validTypes) != 0))
+        return returnError(
+            CL_INVALID_DEVICE_TYPE, __FILE__, __LINE__, buildString("Invalid device type: %llu", static_cast<unsigned long long>(device_type)));
 
     cl_uint num_found = 0;
 

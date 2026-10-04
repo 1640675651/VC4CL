@@ -203,6 +203,8 @@ namespace vc4cl
         // minimum is 2048 (width, height, buffer-size) or 256 (array-size)
         // TMU supports width/height of 2048 pixels
         static constexpr cl_uint MAX_IMAGE_DIMENSION = 2048;
+        // the reported size of __local memory, which is allocated in RAM: the FULL PROFILE minimum of 32 KB
+        static constexpr cl_ulong MAX_LOCAL_MEMORY_SIZE = 32 * 1024;
     } // namespace kernel_config
 
 } // namespace vc4cl

@@ -274,8 +274,9 @@ cl_int Kernel::setArg(cl_uint arg_index, size_t arg_size, const void* arg_value)
                     "The argument value for __local pointers needs to be NULL!");
             //"For arguments declared with the __local qualifier, the size specified will be the size in bytes of the
             // buffer that must be allocated for the __local argument"
+            //"CL_INVALID_ARG_SIZE if [...] the argument is declared with the __local qualifier and arg_size is zero"
             if(arg_size == 0)
-                return returnError(CL_INVALID_ARG_VALUE, __FILE__, __LINE__,
+                return returnError(CL_INVALID_ARG_SIZE, __FILE__, __LINE__,
                     "The argument size for __local pointers must not be zero!");
             if(arg_size > std::numeric_limits<unsigned>::max() || arg_size > system()->getTotalGPUMemory())
                 return returnError(CL_INVALID_ARG_VALUE, __FILE__, __LINE__,
@@ -372,11 +373,24 @@ cl_int Kernel::getWorkGroupInfo(
         return returnValue(tmp.data(), sizeof(size_t), 3, param_value_size, param_value, param_value_size_ret);
     }
     case CL_KERNEL_LOCAL_MEM_SIZE:
+    {
+        //"[...] This includes local memory that may be needed by an implementation to execute the kernel, variables
+        // declared inside the kernel with the __local address qualifier and local memory to be allocated for arguments
+        // to the kernel declared with a pointer type and the __local address qualifier and whose size is specified
+        // with clSetKernelArg."
+        cl_ulong localMemorySize = 0;
         if(auto entry = findMetaData<MetaData::KERNEL_LOCAL_MEMORY_SIZE>(info.metaData))
-            // TODO should also include the size of local parameters, as far as already set!
-            return returnValue<cl_ulong>(entry->getValue<MetaData::KERNEL_LOCAL_MEMORY_SIZE>(), param_value_size,
-                param_value, param_value_size_ret);
-        return returnValue<cl_ulong>(0, param_value_size, param_value, param_value_size_ret);
+            localMemorySize = entry->getValue<MetaData::KERNEL_LOCAL_MEMORY_SIZE>();
+        for(std::size_t i = 0; i < info.parameters.size() && i < args.size(); ++i)
+        {
+            if(info.parameters[i].getAddressSpace() == AddressSpace::LOCAL && argsSetMask.test(i))
+            {
+                if(auto arg = dynamic_cast<const TemporaryBufferArgument*>(args[i].get()))
+                    localMemorySize += arg->sizeToAllocate;
+            }
+        }
+        return returnValue<cl_ulong>(localMemorySize, param_value_size, param_value, param_value_size_ret);
+    }
     case CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE:
         // SIMT kernels: a multiple of 16 work-items fills all SIMD lanes
         return returnValue<size_t>(info.workItemMergeFactor ? info.workItemMergeFactor : 1u, param_value_size,
