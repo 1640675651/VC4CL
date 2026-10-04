@@ -475,9 +475,10 @@ static cl_int split_global_work_size(const std::array<std::size_t, kernel_config
 {
     const size_t total_sizes = global_sizes[0] * global_sizes[1] * global_sizes[2];
     const cl_uint max_group_size = getMaxWorkGroupSize(info);
-    // SIMT kernels only support 1-dimensional work-groups
+    // SIMT kernels without the work-group loop only support 1-dimensional work-groups
     if(total_sizes <= max_group_size &&
-        (info.workItemMergeFactor <= 1 || (global_sizes[1] == 1 && global_sizes[2] == 1)))
+        (info.workItemMergeFactor <= 1 || info.uniformsUsed.getNextGroupFlagUsed() ||
+            (global_sizes[1] == 1 && global_sizes[2] == 1)))
     {
         // can be executed in a single work-group
         local_sizes[0] = global_sizes[0];
@@ -630,7 +631,9 @@ cl_int Kernel::setWorkGroupSizes(CommandQueue* commandQueue, cl_uint work_dim, c
         return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
             buildString("Local work-sizes exceed maximum: %u * %u * %u > %u", local_sizes[0], local_sizes[1],
                 local_sizes[2], getMaxWorkGroupSize(info)));
-    if(mergeFactor > 1 && (local_sizes[1] != 1 || local_sizes[2] != 1))
+    // SIMT kernels with the work-group loop run chunks of 16 work-items of a row (same local IDs in y and z), so any
+    // dimension works. Without it, a QPU runs a whole work-group, with the local IDs of its lanes only in x.
+    if(mergeFactor > 1 && !info.uniformsUsed.getNextGroupFlagUsed() && (local_sizes[1] != 1 || local_sizes[2] != 1))
         return returnError(CL_INVALID_WORK_GROUP_SIZE, __FILE__, __LINE__,
             buildString("Kernels running one work-item per SIMD lane only support 1-dimensional work-groups: %u * %u "
                         "* %u",

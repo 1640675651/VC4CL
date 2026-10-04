@@ -286,7 +286,7 @@ cl_int executeKernel(KernelExecution& args)
     const bool groupPerQPU = mergeFactor > 1 && !hasIndependentWorkItems;
     if(groupPerQPU && localSize > mergeFactor)
         return CL_INVALID_WORK_GROUP_SIZE;
-    // the chunks of a work-group: SIMT kernels only have 1-dimensional work-groups
+    // the chunks of a work-group: a SIMT chunk is up to 16 consecutive work-items in x of a row (same y and z)
     const std::array<std::size_t, kernel_config::NUM_DIMENSIONS> chunkLimits = {
         (args.localSizes[0] + mergeFactor - 1) / mergeFactor, args.localSizes[1], args.localSizes[2]};
     const std::size_t chunksPerGroup =
