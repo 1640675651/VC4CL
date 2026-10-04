@@ -153,7 +153,10 @@ bool vc4cl::emulateQPU(unsigned numQPUs, uint32_t bufferQPUAddress, std::chrono:
     auto bufferIndex = bufferQPUAddress >> INDEX_OFFSET;
     auto controlOffset = bufferQPUAddress & ADDRESS_MASK;
     std::wstringstream logStream;
-    vc4c::setLogger(logStream, false, vc4c::LogLevel::DEBUG);
+    // The log is kept in memory for the whole emulation, which grows by hundreds of MB for long-running kernels at the
+    // debug level, so only keep that if it is dumped afterwards
+    vc4c::setLogger(logStream, false,
+        isDebugModeEnabled(DebugLevel::KERNEL_EXECUTION) ? vc4c::LogLevel::DEBUG : vc4c::LogLevel::WARNING);
     static const auto toDevicePointer = [](uint32_t ptr) -> uint32_t { return (ptr & ~0xC0000000); };
 
     auto& buffer = allocatedMemory.at(bufferIndex);
