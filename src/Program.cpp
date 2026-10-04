@@ -82,29 +82,28 @@ static cl_int extractLog(std::string& log, std::wstringstream& logStream)
 }
 
 /*
- * Removes the options switching VC4C's SIMT mode on or off (--fsimt, --fno-simt, see VC4C's doc/SIMT.md) from the build
- * options, since the front-end compiler doesn't know them, and applies them to the given configuration.
+ * Removes the options of VC4C's optimizations (--f<name>, --fno-<name>, --f<name>=<value>, e.g. --fno-simt, see VC4C's
+ * --help and doc/SIMT.md) from the build options, since the front-end compiler doesn't know them, and applies them to
+ * the given configuration. Other options are left to the front-end.
  */
-static std::string extractSIMTOptions(std::string options, vc4c::Configuration& config)
+static std::string extractCompilerOptions(const std::string& options, vc4c::Configuration& config)
 {
-    for(const std::string flag : {"--fsimt", "--fno-simt"})
+    std::string remaining;
+    std::size_t pos = 0;
+    while(pos < options.size())
     {
-        std::size_t pos = 0;
-        while((pos = options.find(flag, pos)) != std::string::npos)
-        {
-            auto end = pos + flag.size();
-            bool isWholeOption = (pos == 0 || std::isspace(static_cast<unsigned char>(options[pos - 1]))) &&
-                (end == options.size() || std::isspace(static_cast<unsigned char>(options[end])));
-            if(!isWholeOption)
-            {
-                pos = end;
-                continue;
-            }
-            vc4c::tools::parseConfigurationParameter(config, flag);
-            options.erase(pos, flag.size());
-        }
+        auto start = options.find_first_not_of(" \t\n\r", pos);
+        if(start == std::string::npos)
+            break;
+        auto end = options.find_first_of(" \t\n\r", start);
+        if(end == std::string::npos)
+            end = options.size();
+        auto option = options.substr(start, end - start);
+        if(option.compare(0, 3, "--f") != 0 || !vc4c::tools::parseConfigurationParameter(config, option))
+            remaining.append(remaining.empty() ? "" : " ").append(option);
+        pos = end;
     }
-    return options;
+    return remaining;
 }
 
 static cl_int precompile_program(Program* program, const std::string& options,
@@ -154,7 +153,7 @@ static cl_int precompile_program(Program* program, const std::string& options,
             tempHeaderIncludes = " -I /tmp/ ";
 
         auto out = vc4c::Precompiler::precompile(
-            sourceCode, config, tempHeaderIncludes + extractSIMTOptions(options, config));
+            sourceCode, config, tempHeaderIncludes + extractCompilerOptions(options, config));
         if(!out.getRawData(program->intermediateCode))
         {
             std::stringstream tmpStream{};
@@ -296,7 +295,7 @@ static cl_int compile_program(Program* program, const std::string& options)
     {
         vc4c::setLogger(logStream, false, vc4c::LogLevel::WARNING);
 
-        auto compileOptions = extractSIMTOptions(options, config);
+        auto compileOptions = extractCompilerOptions(options, config);
         if(!isSIMTMode())
             // the device limits don't allow the work-group sizes of SIMT kernels
             vc4c::tools::parseConfigurationParameter(config, "--fno-simt");
