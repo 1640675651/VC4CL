@@ -6,6 +6,7 @@
 #include "Context.h"
 
 #include "extensions.h"
+#include "hal/hal.h"
 
 using namespace vc4cl;
 
@@ -209,6 +210,12 @@ cl_context VC4CL_FUNC(clCreateContext)(const cl_context_properties* properties, 
                 CL_INVALID_DEVICE, errcode_ret, __FILE__, __LINE__, "Device is not the VC4CL GPU device!");
     }
     cl_device_id device = *devices;
+
+    if(!system()->isAvailable())
+        //"CL_DEVICE_NOT_AVAILABLE if a device in devices is currently not available even though the device was
+        // returned by clGetDeviceIDs."
+        return returnError<cl_context>(CL_DEVICE_NOT_AVAILABLE, errcode_ret, __FILE__, __LINE__,
+            "The VideoCore IV GPU is not available, since this process may not use the compute jobs of the vc4 driver");
 
     if(pfn_notify == nullptr && user_data != nullptr)
         return returnError<cl_context>(

@@ -258,7 +258,8 @@ cl_int Device::getInfo(
         return returnValue<cl_bool>(CL_TRUE, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_AVAILABLE:
         //"Is CL_TRUE if the device is available and CL_FALSE if the device is not available."
-        return returnValue<cl_bool>(CL_TRUE, param_value_size, param_value, param_value_size_ret);
+        return returnValue<cl_bool>(
+            system()->isAvailable() ? CL_TRUE : CL_FALSE, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_COMPILER_AVAILABLE:
         //"Is CL_FALSE if the implementation does not have a compiler available to compile the program source."
 #if defined(HAS_COMPILER) && HAS_COMPILER == 1

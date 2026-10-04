@@ -36,6 +36,9 @@ static bool isRoot()
     return geteuid() == 0;
 }
 
+// Set by initializeDRM(), see ExecutionMode::UNAVAILABLE
+static bool drmComputeNotPermitted = false;
+
 static std::unique_ptr<DRM> initializeDRM(bool isEmulated)
 {
     if(isEmulated || std::getenv("VC4CL_NO_DRM"))
@@ -47,7 +50,7 @@ static std::unique_ptr<DRM> initializeDRM(bool isEmulated)
         if(std::getenv(env))
             return nullptr;
     }
-    return DRM::create();
+    return DRM::create(drmComputeNotPermitted);
 }
 
 static ExecutionMode getExecMode(bool hasDRM)
@@ -55,6 +58,10 @@ static ExecutionMode getExecMode(bool hasDRM)
     // Kernels running as compute jobs of the vc4 DRM driver can only access buffers of the driver
     if(hasDRM)
         return ExecutionMode::VC4_DRM;
+    if(drmComputeNotPermitted)
+        // the other execution modes would conflict with the driver (and the firmware's GPU service never runs the
+        // kernels, so every launch would wait for the timeout)
+        return ExecutionMode::UNAVAILABLE;
     if(std::getenv("VC4CL_EXECUTE_REGISTER_POKING"))
         return ExecutionMode::V3D_REGISTER_POKING;
     if(std::getenv("VC4CL_EXECUTE_MAILBOX"))
@@ -72,6 +79,8 @@ static MemoryManagement getMemoryMode(bool hasDRM)
 {
     if(hasDRM)
         return MemoryManagement::VC4_DRM;
+    if(drmComputeNotPermitted)
+        return MemoryManagement::UNAVAILABLE;
     #ifndef NO_VCSM
     if(std::getenv("VC4CL_MEMORY_CMA"))
         return MemoryManagement::VCSM_CMA;
@@ -123,6 +132,8 @@ static std::unique_ptr<V3D> initializeV3D(bool isEmulated, ExecutionMode execMod
         // explicitly disabled
         return nullptr;
 
+    if(execMode == ExecutionMode::UNAVAILABLE)
+        return nullptr;
     if(execMode == ExecutionMode::VC4_DRM)
     {
         // Accessing the V3D registers directly would interfere with the driver (e.g. keeping V3D powered on prevents

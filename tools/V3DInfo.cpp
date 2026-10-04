@@ -66,6 +66,8 @@ static std::string toString(ExecutionMode mode)
         return "VCHI GPU service";
     case ExecutionMode::VC4_DRM:
         return "vc4 DRM compute jobs";
+    case ExecutionMode::UNAVAILABLE:
+        return "none (vc4 DRM compute jobs not permitted)";
     }
     throw std::invalid_argument{"Unknown execution mode: " + std::to_string(static_cast<unsigned>(mode))};
 }
@@ -78,6 +80,8 @@ static std::string toString(MemoryManagement mode)
         return "mailbox";
     case MemoryManagement::VC4_DRM:
         return "vc4 DRM buffer objects";
+    case MemoryManagement::UNAVAILABLE:
+        return "none (vc4 DRM compute jobs not permitted)";
     #ifndef NO_VCSM
     case MemoryManagement::VCSM:
         return "VCSM";

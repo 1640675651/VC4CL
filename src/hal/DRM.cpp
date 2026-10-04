@@ -86,8 +86,9 @@ static std::string checkDevice(int fd)
     return "";
 }
 
-std::unique_ptr<DRM> DRM::create()
+std::unique_ptr<DRM> DRM::create(bool& computeNotPermitted)
 {
+    computeNotPermitted = false;
     for(unsigned minor = 128; minor < 192; ++minor)
     {
         std::string path = "/dev/dri/renderD" + std::to_string(minor);
@@ -102,11 +103,15 @@ std::unique_ptr<DRM> DRM::create()
         DEBUG_LOG(DebugLevel::SYSTEM_ACCESS,
             std::cout << "[VC4CL] Not using " << path << " for compute jobs: " << reason << std::endl)
         if(reason == NOT_PERMITTED)
-            // Otherwise we silently fall back to direct hardware access, which does not work as non-root on arm64 and
-            // conflicts with the driver.
-            std::cout << "[VC4CL] The vc4 driver supports compute jobs, but this process may not use them. They need "
-                         "root rights or membership in the group set by the vc4 module parameter compute_gid."
+        {
+            // Any other way of running kernels (direct hardware access, the firmware's GPU service) conflicts with the
+            // driver, so no kernels can be run at all.
+            computeNotPermitted = true;
+            std::cout << "[VC4CL] The vc4 driver supports compute jobs, but this process may not use them, so the "
+                         "VideoCore IV GPU is not available. They need root rights or membership in the group set by "
+                         "the vc4 module parameter compute_gid."
                       << std::endl;
+        }
     }
     return nullptr;
 }

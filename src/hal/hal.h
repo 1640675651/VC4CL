@@ -39,7 +39,10 @@ namespace vc4cl
         V3D_REGISTER_POKING,
         VCHI_GPU_SERVICE,
         // compute jobs of the (patched) vc4 DRM driver
-        VC4_DRM
+        VC4_DRM,
+        // the vc4 DRM driver supports compute jobs, but this process may not use them. Any other way of running
+        // kernels would conflict with the driver, so none is used.
+        UNAVAILABLE
     };
 
     enum class MemoryManagement : uint8_t
@@ -47,6 +50,8 @@ namespace vc4cl
         MAILBOX,
         // buffer objects of the vc4 DRM driver
         VC4_DRM,
+        // see ExecutionMode::UNAVAILABLE
+        UNAVAILABLE,
 	#ifndef NO_VCSM
         VCSM,
         VCSM_CMA
@@ -106,6 +111,15 @@ namespace vc4cl
 
         std::string getModelType();
         std::string getProcessorType();
+
+        /*
+         * Whether kernels can be run, false if the vc4 DRM driver supports compute jobs, but this process may not use
+         * them (see ExecutionMode::UNAVAILABLE)
+         */
+        inline bool isAvailable() const
+        {
+            return isEmulated || executionMode != ExecutionMode::UNAVAILABLE;
+        }
 
         inline DRM* getDRMIfAvailable()
         {

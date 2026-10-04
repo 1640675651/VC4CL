@@ -33,7 +33,11 @@ namespace vc4cl
          * Returns the DRM backend if a vc4 render node supports compute jobs and this process is allowed to use them,
          * otherwise nullptr.
          */
-        static std::unique_ptr<DRM> create();
+        /*
+         * Returns the vc4 DRM device to run compute jobs with, or nullptr. Sets computeNotPermitted if the driver
+         * supports compute jobs, but this process may not use them.
+         */
+        static std::unique_ptr<DRM> create(bool& computeNotPermitted);
 
         DRM(const DRM&) = delete;
         DRM(DRM&&) = delete;
