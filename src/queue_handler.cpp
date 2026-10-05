@@ -125,6 +125,10 @@ void EventQueue::runEventQueue()
             {
                 // at least one event in the wait list had an error, so we abort this execution
                 event->updateStatus(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+                // release the reference taken when queuing the event, as for executed events
+                cl_int status = event->release();
+                if(status != CL_SUCCESS)
+                    event->updateStatus(status, false);
             }
             else
             {

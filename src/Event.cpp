@@ -34,12 +34,16 @@ cl_int Event::setUserEventStatus(cl_int execution_status)
         return returnError(CL_INVALID_VALUE, __FILE__, __LINE__,
             buildString("Event has already finished with status %d", execution_status));
 
-    std::lock_guard<std::mutex> guard(statusLock);
-    if(userStatusSet)
-        return returnError(CL_INVALID_OPERATION, __FILE__, __LINE__, "User status has already been set!");
-
-    status = execution_status;
-    userStatusSet = true;
+    {
+        std::lock_guard<std::mutex> guard(statusLock);
+        if(userStatusSet)
+            return returnError(CL_INVALID_OPERATION, __FILE__, __LINE__, "User status has already been set!");
+        userStatusSet = true;
+    }
+    //"The registered callback function will be called when the execution status of command associated with event
+    // changes to an execution status equal to or past the status specified by command_exec_status", also for error
+    // states (which are past CL_COMPLETE)
+    updateStatus(execution_status);
 
     return CL_SUCCESS;
 }
@@ -148,8 +152,14 @@ cl_int Event::waitFor() const
     for(auto& e : waitList)
     {
         if(e->waitFor() != CL_SUCCESS)
+        {
+            // the queue handler aborts this event too: wait for it to be updated, so the status queried afterwards
+            // is the error status
+            if(!isFinished())
+                EventQueue::getInstance()->waitForEvent(this);
             return returnError(
                 CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST, __FILE__, __LINE__, "Error in event in wait-list");
+        }
     }
 
     if(!isFinished())
@@ -186,18 +196,22 @@ void Event::fireCallbacks(cl_int previousStatus)
 
 void Event::updateStatus(cl_int status, bool fireCallbacks)
 {
-    std::lock_guard<std::mutex> guard(statusLock);
-    if(status == this->status)
-        // don't repeat setting status, e.g. required in queue handler, if events on wait list are not done yet
-        return;
-    auto oldStatus = this->status;
-    this->status = status;
-    if(status == CL_SUBMITTED)
-        setTime(profile.submit_time);
-    else if(status == CL_RUNNING)
-        setTime(profile.start_time);
-    else
-        setTime(profile.end_time);
+    cl_int oldStatus;
+    {
+        std::lock_guard<std::mutex> guard(statusLock);
+        if(status == this->status)
+            // don't repeat setting status, e.g. required in queue handler, if events on wait list are not done yet
+            return;
+        oldStatus = this->status;
+        this->status = status;
+        if(status == CL_SUBMITTED)
+            setTime(profile.submit_time);
+        else if(status == CL_RUNNING)
+            setTime(profile.start_time);
+        else
+            setTime(profile.end_time);
+    }
+    // without holding the lock, since the callbacks may query the event's status
     if(fireCallbacks)
         this->fireCallbacks(oldStatus);
 }
