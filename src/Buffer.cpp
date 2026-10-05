@@ -1150,7 +1150,10 @@ cl_mem VC4CL_FUNC(clCreateBuffer)(
     if(!buffer->deviceBuffer)
     {
         ignoreReturnValue(buffer->release(), __FILE__, __LINE__, "Already errored");
-        return returnError<cl_mem>(CL_OUT_OF_RESOURCES, errcode_ret, __FILE__, __LINE__,
+        //"CL_MEM_OBJECT_ALLOCATION_FAILURE if there is a failure to allocate memory for buffer object."
+        // Programs (e.g. OpenCL-CTS) retry with a smaller size on this error. Allocations below
+        // CL_DEVICE_MAX_MEM_ALLOC_SIZE can fail, since contiguous GPU memory (CMA) is shared with other drivers.
+        return returnError<cl_mem>(CL_MEM_OBJECT_ALLOCATION_FAILURE, errcode_ret, __FILE__, __LINE__,
             buildString("Failed to allocate enough device memory (%u)!", size));
     }
 
