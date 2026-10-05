@@ -10,6 +10,7 @@
 #include "Kernel.h"
 #include "PerformanceCounter.h"
 #include "hal/hal.h"
+#include "printf.h"
 
 #include <CL/opencl.h>
 
@@ -216,6 +217,19 @@ static void dumpMemoryState(std::ostream& os, const Kernel* kernel, const Kernel
             }
         }
     }
+}
+
+// Prints the output of the printf() calls of the finished kernel execution
+static void printPrintfOutput(const KernelExecution& args)
+{
+    if(!args.kernel->hasPrintfBuffer())
+        return;
+    auto bufferIt = args.tmpBuffers.find(static_cast<unsigned>(args.kernel->info.parameters.size() - 1));
+    if(bufferIt == args.tmpBuffers.end() || !bufferIt->second)
+        return;
+    auto output = formatPrintfBuffer(bufferIt->second->hostPointer, args.kernel->program->globalData);
+    fwrite(output.data(), 1, output.size(), stdout);
+    fflush(stdout);
 }
 
 static bool flushHostCache(SystemAccess& system, const std::unique_ptr<DeviceBuffer>& kernelBuffer,
@@ -541,6 +555,8 @@ cl_int executeKernel(KernelExecution& args)
         }
         auto status = result.waitFor();
         perfCollector.reset();
+        if(status)
+            printPrintfOutput(args);
         DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
             dumpMemoryState(f, kernel, args, *buffer, qpu_code, uniformBlocks[0], false))
 
@@ -705,6 +721,8 @@ cl_int executeKernel(KernelExecution& args)
     // wait for (possible asynchronous) execution before freeing the buffers
     auto status = result.waitFor();
     perfCollector.reset();
+    if(status)
+        printPrintfOutput(args);
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
         // Append the buffers after the kernel execution

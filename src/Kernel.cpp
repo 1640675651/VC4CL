@@ -98,6 +98,24 @@ std::unique_ptr<KernelArgument> BufferArgument::clone() const
 Kernel::Kernel(Program* program, const KernelHeader& info) : program(program), info(info), argsSetMask(0)
 {
     args.resize(info.parameters.size());
+    if(hasPrintfBuffer())
+    {
+        // the printf buffer is allocated for every execution with the counter of written bytes reset to zero
+        const uint32_t usedBytes = 0;
+        args.back().reset(new TemporaryBufferArgument(
+            4 + kernel_config::PRINTF_BUFFER_SIZE + kernel_config::PRINTF_MAX_RECORD_SIZE, &usedBytes, sizeof(usedBytes)));
+        argsSetMask.set(info.parameters.size() - 1, true);
+    }
+}
+
+bool Kernel::hasPrintfBuffer() const
+{
+    return !info.parameters.empty() && info.parameters.back().name == kernel_config::PRINTF_BUFFER_PARAMETER_NAME;
+}
+
+cl_uint Kernel::getNumUserArguments() const
+{
+    return static_cast<cl_uint>(info.parameters.size() - (hasPrintfBuffer() ? 1 : 0));
 }
 
 Kernel::Kernel(const Kernel& other) : Object(), program(other.program), info(other.info), argsSetMask(other.argsSetMask)
@@ -120,10 +138,10 @@ cl_int Kernel::setArg(cl_uint arg_index, size_t arg_size, const void* arg_value)
                   << info.parameters[arg_index].typeName << " '" << info.parameters[arg_index].name << "' with size "
                   << static_cast<size_t>(info.parameters[arg_index].getSize()) << std::endl);
 
-    if(arg_index >= info.parameters.size())
+    if(arg_index >= getNumUserArguments())
     {
         return returnError(CL_INVALID_ARG_INDEX, __FILE__, __LINE__,
-            buildString("Invalid arg index: %d of %d", arg_index, info.parameters.size()));
+            buildString("Invalid arg index: %d of %d", arg_index, getNumUserArguments()));
     }
 
     const auto& paramInfo = info.parameters[arg_index];
@@ -317,8 +335,7 @@ cl_int Kernel::getInfo(
     case CL_KERNEL_FUNCTION_NAME:
         return returnString(info.name, param_value_size, param_value, param_value_size_ret);
     case CL_KERNEL_NUM_ARGS:
-        return returnValue<cl_uint>(
-            static_cast<cl_uint>(info.parameters.size()), param_value_size, param_value, param_value_size_ret);
+        return returnValue<cl_uint>(getNumUserArguments(), param_value_size, param_value, param_value_size_ret);
     case CL_KERNEL_REFERENCE_COUNT:
         return returnValue<cl_uint>(referenceCount, param_value_size, param_value, param_value_size_ret);
     case CL_KERNEL_CONTEXT:
@@ -409,9 +426,9 @@ cl_int Kernel::getWorkGroupInfo(
 cl_int Kernel::getArgInfo(cl_uint arg_index, cl_kernel_arg_info param_name, size_t param_value_size, void* param_value,
     size_t* param_value_size_ret)
 {
-    if(arg_index >= info.parameters.size())
+    if(arg_index >= getNumUserArguments())
         return returnError(CL_INVALID_ARG_INDEX, __FILE__, __LINE__,
-            buildString("Invalid argument index %u (of %u)", arg_index, info.parameters.size()));
+            buildString("Invalid argument index %u (of %u)", arg_index, getNumUserArguments()));
 
     const auto& paramInfo = info.parameters[arg_index];
 

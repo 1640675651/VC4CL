@@ -205,6 +205,14 @@ namespace vc4cl
         static constexpr cl_uint MAX_IMAGE_DIMENSION = 2048;
         // the reported size of __local memory, which is allocated in RAM: the FULL PROFILE minimum of 32 KB
         static constexpr cl_ulong MAX_LOCAL_MEMORY_SIZE = 32 * 1024;
+        /*
+         * The buffer for printf() output, a hidden last kernel parameter added by the compiler.
+         *
+         * NOTE: These need to match the PRINTF_BUFFER_* constants of VC4C (include/config.h)!
+         */
+        static constexpr const char* PRINTF_BUFFER_PARAMETER_NAME = "__vc4cl_printf_buffer";
+        static constexpr unsigned PRINTF_BUFFER_SIZE = 16 * 1024;
+        static constexpr unsigned PRINTF_MAX_RECORD_SIZE = 1024;
     } // namespace kernel_config
 
 } // namespace vc4cl

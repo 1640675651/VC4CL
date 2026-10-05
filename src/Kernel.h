@@ -46,6 +46,16 @@ namespace vc4cl
             const size_t* global_work_offset, const size_t* global_work_size, const size_t* local_work_size,
             cl_uint num_events_in_wait_list, const cl_event* event_wait_list, cl_event* event);
 
+        /*
+         * Whether the kernel calls printf(), in which case the compiler added the printf buffer as hidden last
+         * parameter
+         */
+        bool hasPrintfBuffer() const;
+        /*
+         * The number of parameters set by the user, excluding the hidden printf buffer
+         */
+        cl_uint getNumUserArguments() const;
+
         object_wrapper<Program> program;
         const KernelHeader info;
 
@@ -105,9 +115,14 @@ namespace vc4cl
     {
         TemporaryBufferArgument(unsigned bufferSize) : sizeToAllocate(bufferSize) {}
         TemporaryBufferArgument(unsigned bufferSize, const void* directData) :
-            sizeToAllocate(bufferSize), data(bufferSize)
+            TemporaryBufferArgument(bufferSize, directData, bufferSize)
         {
-            memcpy(data.data(), directData, bufferSize);
+        }
+        // initializes only the first dataSize bytes of the buffer
+        TemporaryBufferArgument(unsigned bufferSize, const void* directData, unsigned dataSize) :
+            sizeToAllocate(bufferSize), data(dataSize)
+        {
+            memcpy(data.data(), directData, dataSize);
         }
         ~TemporaryBufferArgument() noexcept override;
 

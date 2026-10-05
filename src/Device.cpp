@@ -347,9 +347,8 @@ cl_int Device::getInfo(
     case CL_DEVICE_PRINTF_BUFFER_SIZE:
         //"Maximum size of the internal buffer that holds the output of printf calls from a kernel.
         // The minimum value for the FULL profile is 1 MB (1KB for EMBEDDED PROFILE)."
-        // TODO printf support (OpenCL 1.2, page 284) -> write to VPM (special area, with index for current position)
-        // and print from host..  but how to synchronize index, etc. ??
-        return returnValue<size_t>(0, param_value_size, param_value, param_value_size_ret);
+        return returnValue<size_t>(
+            kernel_config::PRINTF_BUFFER_SIZE, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_PREFERRED_INTEROP_USER_SYNC:
         //"Is CL_TRUE if the device's preference is for the user to be responsible for synchronization,
         // when sharing memory objects between OpenCL and other APIs [...]"

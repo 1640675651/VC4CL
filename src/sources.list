@@ -15,6 +15,7 @@ target_sources(VC4CL
     Memory.cpp
     ObjectTracker.cpp
     PerformanceCounter.cpp
+    printf.cpp
     Platform.cpp
     Program.cpp
     queue_handler.cpp
