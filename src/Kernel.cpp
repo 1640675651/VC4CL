@@ -108,6 +108,11 @@ Kernel::Kernel(Program* program, const KernelHeader& info) : program(program), i
     }
 }
 
+bool Kernel::loopsOverWorkItems() const
+{
+    return findMetaData<MetaData::KERNEL_MAX_WORK_GROUP_SIZE>(info.metaData) != nullptr;
+}
+
 bool Kernel::hasPrintfBuffer() const
 {
     return !info.parameters.empty() && info.parameters.back().name == kernel_config::PRINTF_BUFFER_PARAMETER_NAME;
@@ -353,8 +358,10 @@ cl_int Kernel::getInfo(
 
 /*
  * The maximum number of work-items in a work-group of a kernel:
- * - kernels with independent work-items (always in SIMT mode) run chunks of work-items (16 in SIMT mode, otherwise 1)
- *   on any QPU, one after the other (see executor.cpp), so the work-groups are only limited by the device limit,
+ * - kernels with independent work-items run chunks of work-items (16 for SIMT kernels, otherwise 1) on any QPU, one
+ *   after the other (see executor.cpp), so the work-groups are only limited by the device limit, in both modes,
+ * - kernels whose QPUs loop over the work-items of a work-group (kernels with barriers) report their limit in the
+ *   metadata, all QPUs run a work-group at the same time,
  * - other kernels run one work-item per QPU at the same time, or (SIMT mode without the loop over independent
  *   work-items) one work-group per QPU.
  */
@@ -362,7 +369,10 @@ static cl_uint getMaxWorkGroupSize(const KernelHeader& info)
 {
     auto numQPUs = system()->getNumQPUs();
     if(info.uniformsUsed.getNextGroupFlagUsed())
-        return isSIMTMode() ? numQPUs * static_cast<cl_uint>(SIMT_WORK_ITEMS_PER_QPU) : numQPUs;
+        return numQPUs * static_cast<cl_uint>(SIMT_WORK_ITEMS_PER_QPU);
+    if(auto entry = findMetaData<MetaData::KERNEL_MAX_WORK_GROUP_SIZE>(info.metaData))
+        return std::min(entry->getValue<MetaData::KERNEL_MAX_WORK_GROUP_SIZE>(),
+            numQPUs * static_cast<cl_uint>(SIMT_WORK_ITEMS_PER_QPU));
     if(info.workItemMergeFactor > 1)
         return info.workItemMergeFactor;
     return numQPUs;

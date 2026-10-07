@@ -291,9 +291,10 @@ cl_int executeKernel(KernelExecution& args)
 
     auto mergeFactor = std::max(kernel->info.workItemMergeFactor, uint8_t{1});
     size_t localSize = args.localSizes[0] * args.localSizes[1] * args.localSizes[2];
-    // Kernels with independent work-items (always in SIMT mode) run chunks of work-items (16 in SIMT mode, otherwise
-    // 1) on any QPU: every QPU gets one block of UNIFORMs per chunk it runs, each followed by a flag whether another
-    // block follows. So a single launch runs many chunks, of any work-groups.
+    // Kernels with independent work-items (in both modes) run chunks of work-items (16 for SIMT kernels, otherwise 1)
+    // on any QPU: every QPU gets one block of UNIFORMs per chunk it runs, each followed by a flag whether another
+    // block follows. So a single launch runs many chunks, of any work-groups, and work-groups of up to 192
+    // work-items.
     const bool hasIndependentWorkItems = kernel->info.uniformsUsed.getNextGroupFlagUsed();
     // SIMT kernels without that loop run a single work-group (of at most 16 work-items) per QPU and launch. Other
     // kernels run one work-item per QPU, the number of QPUs is the number of work-items in a work-group.
@@ -306,10 +307,14 @@ cl_int executeKernel(KernelExecution& args)
     const std::size_t chunksPerGroup =
         hasIndependentWorkItems ? chunkLimits[0] * chunkLimits[1] * chunkLimits[2] : 1;
     const std::size_t numChunks = numGroups * chunksPerGroup;
+    // Kernels with barriers whose QPUs loop over the work-items of their work-group: QPU i runs the work-items i, i +
+    // number of QPUs, ...
     size_t numQPUs = hasIndependentWorkItems ?
         std::min<size_t>(args.system->getNumQPUs(), numChunks) :
         (groupPerQPU ? std::min<size_t>(args.system->getNumQPUs(), numGroups) :
-                       (localSize / mergeFactor) + (localSize % mergeFactor != 0));
+                       (kernel->loopsOverWorkItems() ?
+                               std::min<size_t>(args.system->getNumQPUs(), localSize) :
+                               (localSize / mergeFactor) + (localSize % mergeFactor != 0)));
     if(numQPUs > args.system->getNumQPUs())
         return CL_INVALID_GLOBAL_WORK_SIZE;
 

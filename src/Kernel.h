@@ -55,6 +55,11 @@ namespace vc4cl
          * The number of parameters set by the user, excluding the hidden printf buffer
          */
         cl_uint getNumUserArguments() const;
+        /*
+         * Whether the QPUs running a work-group of the kernel loop over its work-items (the kernel has barriers, see
+         * VC4C's normalization/WorkItemLoops.cpp), so min(local size, number of QPUs) QPUs run a work-group
+         */
+        bool loopsOverWorkItems() const;
 
         object_wrapper<Program> program;
         const KernelHeader info;

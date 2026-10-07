@@ -53,10 +53,10 @@ cl_int Device::getInfo(
         //"Maximum number of work-items that can be specified in each dimension of the work-group.
         // Returns n size_t entries, where n is the value returned by the query for CL_DEVICE_MAX_WORK_ITEM_DIMENSIONS.
         // The minimum value is (1, 1, 1)."
-        // In SIMT mode, work-groups of kernels with independent work-items run in chunks on any QPU: 16 work-items per
-        // QPU in SIMT mode (1-dimensional work-groups only), otherwise 1 work-item, in any dimension. Kernels with
-        // barriers or __local memory report their lower limit via CL_KERNEL_WORK_GROUP_SIZE.
-        size_t maxSize = system()->getNumQPUs() * (isSIMTMode() ? SIMT_WORK_ITEMS_PER_QPU : 1u);
+        // Work-groups of kernels with independent work-items run in chunks on any QPU, one after the other: 16
+        // work-items per chunk for SIMT kernels, otherwise 1 work-item, in any dimension. The limits are the same in
+        // both modes. Kernels with barriers or __local memory report their lower limit via CL_KERNEL_WORK_GROUP_SIZE.
+        size_t maxSize = system()->getNumQPUs() * SIMT_WORK_ITEMS_PER_QPU;
         std::array<size_t, kernel_config::NUM_DIMENSIONS> tmp{maxSize, maxSize, maxSize};
         return returnValue(tmp.data(), sizeof(size_t), tmp.size(), param_value_size, param_value, param_value_size_ret);
     }
@@ -65,8 +65,7 @@ cl_int Device::getInfo(
         // parallel execution model."
         // see CL_DEVICE_MAX_WORK_ITEM_SIZES
         return returnValue<size_t>(
-            system()->getNumQPUs() * (isSIMTMode() ? SIMT_WORK_ITEMS_PER_QPU : 1u), param_value_size, param_value,
-            param_value_size_ret);
+            system()->getNumQPUs() * SIMT_WORK_ITEMS_PER_QPU, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_PREFERRED_VECTOR_WIDTH_CHAR:
         //"Preferred native vector width size for built-in scalar types that can be put into vectors.
         // The vector width is defined as the number of scalar elements that can be stored in the vector. "

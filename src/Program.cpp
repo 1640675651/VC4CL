@@ -297,7 +297,7 @@ static cl_int compile_program(Program* program, const std::string& options)
 
         auto compileOptions = extractCompilerOptions(options, config);
         if(!isSIMTMode())
-            // the device limits don't allow the work-group sizes of SIMT kernels
+            // classic mode: one work-item per QPU program run, also for kernels which could use SIMT mode
             vc4c::tools::parseConfigurationParameter(config, "--fno-simt");
         auto result = vc4c::Compiler::compile(intermediateCode, config, compileOptions);
         program->binaryCode.resize(result.second / sizeof(uint64_t), '\0');
