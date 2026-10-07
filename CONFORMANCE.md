@@ -15,8 +15,8 @@ not a conformance submission to Khronos.
 | | SIMT | Classic |
 |---|---|---|
 | Suites run | 18 | 18 |
-| Subtests passed | 449 | 449 |
-| Subtests failed | 2 | 5 |
+| Subtests passed | 449 | 452 |
+| Subtests failed | 2 | 2 |
 | Subtests timed out (30-minute limit of the runner) | 6 | 3 |
 | Subtests skipped (unsupported features) | 150 | 150 |
 
@@ -46,12 +46,17 @@ Most suites were last run on 2026-10-05, after the latest compiler fixes. `alloc
 allocation fixes and its rounding of float literals. `thread_dimensions`' two failing subtests were
 rerun with the fix for global sizes above 2^24.
 
+On 2026-10-06 classic mode changed to the same work-group limits as SIMT mode (192 instead of 12).
+`api` and `basic` were rerun in classic mode with the new limits. The other classic-mode results are
+from before; with the larger limits, classic mode now also runs the largest `thread_dimensions`
+configurations (see below), so its `thread_dimensions` timeouts are expected to match SIMT mode's.
+
 ## Results per suite
 
 | Suite | SIMT pass | SIMT other | Classic pass | Classic other | Skipped |
 |---|---|---|---|---|---|
 | allocations | 6 | | 6 | | |
-| api | 95 | | 92 | 3 fail | 69 |
+| api | 95 | | 95 | | 69 |
 | atomics | 13 | | 13 | | |
 | basic | 64 | | 64 | | 48 |
 | buffers | 91 | | 91 | | 12 |
@@ -82,14 +87,15 @@ large operands the two roundings toward zero add up to more than the absolute er
 `0x1.48ecef3cf1ap+26`). The embedded profile allows rounding toward zero, but this test's bound
 doesn't account for it. Passing it would need software rounding to nearest for this function.
 
-### `api`: `work_group_suggested_local_size_1D`, `_2D`, `_3D` (classic mode)
+### Fixed: `api`: `work_group_suggested_local_size_1D`, `_2D`, `_3D` (classic mode)
 
-In classic mode the maximum work-group size is 12 (one work-item per QPU). The test's "odd sizes"
-case needs an odd work-group size that is not prime (counting 1 as prime) below the device maximum,
-and there is none below 17. In SIMT mode the maximum is larger and the tests pass. This is a
-limitation of the test, not a wrong result.
+These failed while classic mode reported a maximum work-group size of 12 (one work-item per QPU): the
+test's "odd sizes" case needs an odd work-group size that is not prime (counting 1 as prime) below
+the device maximum, and there is none below 17. Since 2026-10-06 classic mode reports the same limits
+as SIMT mode (192 work-items; kernels with barriers or `__local` memory still accept only 12), and
+the three subtests pass.
 
-### `thread_dimensions`: time limit
+### `thread_dimensions`: time limit and slowness
 
 These subtests didn't finish within 30 minutes. None of them reported a wrong result before being
 stopped (their logs only show the test reducing its 128 MB buffer to what the CMA pool could
@@ -99,9 +105,62 @@ provide):
   `full_3d_implicit_local`, `quick_2d_explicit_local`, `quick_3d_explicit_local`
 - Classic: `full_2d_explicit_local`, `full_3d_explicit_local`, `full_3d_implicit_local`
 
-The suite launches very many kernels over a large range of work sizes. SIMT mode is slower here
-because a SIMT chunk covers one row of a work-group in x, so work-groups narrower than 16 in x leave
-lanes idle. Whether these subtests pass when run without the limit is untested.
+The suite runs global sizes of up to 1024 × 1024 × 1024 work-items. It skips the largest ones if the
+local size is small (below 16 work-items for more than 8192² work-items in total, below 64 for more
+than 16384²), "as it will take a long time". In classic mode the maximum work-group size is 12, so the
+test picks local sizes of 8 or 11 and skips them. In SIMT mode it picks 93 or 128 and runs them,
+about 2^30 work-items each, at about 0.5 million work-items per second in both modes.
+
+So SIMT mode gets more work, it isn't slower. Measured for `quick_3d_explicit_local` with timestamps:
+the 52 configurations both modes run took 447 s in classic and 432 s in SIMT mode. Classic mode then
+skipped the configurations of 1024³ and 1023³ work-items and passed after 458 s. SIMT mode ran the
+first of them and had not finished it after 459 s. The other subtests run larger global sizes in
+both modes, which is why they also take longer than 30 minutes in classic mode.
+
+**Rerun with a 6-hour limit** (2026-10-06 02:09 to 12:00, stopped before all subtests ran):
+
+| Subtest | SIMT | Classic |
+|---|---|---|
+| `full_2d_implicit_local` | pass, 40 min | (passed in 30 min before) |
+| `quick_2d_explicit_local` | pass, 2 h 11 min | (passed in 15 min before) |
+| `quick_3d_explicit_local` | timeout after 6 h | (passed in 5–8 min before) |
+| `full_2d_explicit_local` | stopped after 1 h, 669 configurations passed | not run |
+| `full_3d_implicit_local` | not run | not run |
+| `full_3d_explicit_local` | not run | not run |
+
+**Why a single configuration takes so long.** Every work-item of the test kernel adds 1 to its own
+output word with `atom_add` (and sets error bits with `atom_or` if its ID is out of range). The result
+buffer can't hold one word per work-item for the large sizes, so the test covers the index range in
+windows: for every window it fills the buffer with zeros (`clEnqueueFillBuffer`), launches the
+**whole** NDRange (work-items outside the window skip the atomic), maps the buffer and checks every
+word on the CPU. For 1024 × 1024 × 1024 work-items and the 80 MB the CMA pool provided, these are 52
+windows, so 52 launches of 2^30 work-items, about 56 billion work-item executions for one
+configuration. `quick_3d_explicit_local` has two such configurations (1024³ and 1023³), which is why
+it needs roughly a day in SIMT mode. On the side of VC4CL and VC4C, these costs add up:
+
+- **The kernel can't use SIMT mode** (it uses atomics), in either mode, so every chunk of the
+  NDRange is a single work-item. VC4CL writes a block of UNIFORMs (IDs, sizes, arguments, about 14
+  words) for every chunk on the host, and a launch carries at most 64K UNIFORM words, so a launch of
+  2^30 work-items is about 230,000 GPU jobs. Each job is a separate ioctl, and the driver polls for
+  its completion every 100 µs (every 1 ms after the first 10 ms). This keeps the CPU busy for the
+  whole run.
+- **Global atomics are serialized**: every atomic takes the GPU-wide hardware mutex and does a DMA
+  read and a DMA write, so all 12 QPUs together reach about 0.5 million atomics per second.
+- **The fill runs on the CPU, one `memcpy` per 4-byte pattern**, i.e. 20 million calls for an 80 MB
+  buffer, into write-combined memory, once per window.
+- **The check** reads the whole buffer, mapped uncached, on the CPU once per window. This cost is
+  the test's own.
+
+None of this is wrong behavior, but it makes kernels with many work-items and little work per
+work-item much slower than necessary whenever they can't use SIMT mode. Possible improvements:
+
+1. Let the QPU loop over the work-items of its chunk and compute their IDs itself, instead of one
+   UNIFORM block per work-item written by the host. This would reduce the host work and the number of
+   GPU jobs by orders of magnitude for every non-SIMT kernel with independent work-items, and fits
+   the work-item loops planned for larger work-groups (VC4C `doc/SIMT.md`, roadmap item 3).
+2. Fill buffers with word-sized stores instead of a `memcpy` per pattern, or on the GPU.
+3. Cheaper global atomics, e.g. batching the atomics of a QPU under one mutex lock where the
+   addresses allow it (harder).
 
 ## Skipped subtests
 
