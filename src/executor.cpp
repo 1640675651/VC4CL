@@ -44,8 +44,8 @@ static unsigned AS_GPU_ADDRESS(const unsigned* ptr, DeviceBuffer* buffer)
         static_cast<uint32_t>(buffer->qpuPointer) + ((tmp) - reinterpret_cast<char*>(buffer->hostPointer)));
 }
 
-static size_t get_size(
-    uint8_t numQPUS, size_t code_size, size_t num_uniforms, size_t global_data_size, size_t stackFrameSizeInWords)
+static size_t get_size(uint8_t numQPUS, size_t code_size, size_t num_uniforms, size_t global_data_size,
+    size_t numStackFrames, size_t stackFrameSizeInWords)
 {
     // we duplicate the UNIFORMs to be able to update one block while the second one is used for execution
     size_t uniformSize = 2 * sizeof(unsigned) * num_uniforms;
@@ -53,7 +53,7 @@ static size_t get_size(
     // we need 2 launch message blocks, one per UNIFORM block (see above)
     size_t launchMessageSize = 2 * 2 * sizeof(uint32_t) * numQPUS;
     size_t rawSize = code_size + uniformSize + global_data_size +
-        numQPUS * stackFrameSizeInWords * sizeof(uint64_t) /* word-size */ + launchMessageSize;
+        numStackFrames * stackFrameSizeInWords * sizeof(uint64_t) /* word-size */ + launchMessageSize;
     // round up to next multiple of alignment
     return (rawSize / PAGE_ALIGNMENT + 1) * PAGE_ALIGNMENT;
 }
@@ -296,9 +296,10 @@ cl_int executeKernel(KernelExecution& args)
     // block follows. So a single launch runs many chunks, of any work-groups, and work-groups of up to 192
     // work-items.
     const bool hasIndependentWorkItems = kernel->info.uniformsUsed.getNextGroupFlagUsed();
-    // SIMT kernels without that loop run a single work-group (of at most 16 work-items) per QPU and launch. Other
-    // kernels run one work-item per QPU, the number of QPUs is the number of work-items in a work-group.
-    const bool groupPerQPU = mergeFactor > 1 && !hasIndependentWorkItems;
+    // SIMT kernels without that loop (and not looping over the chunks of their work-group, see below) run a single
+    // work-group (of at most 16 work-items) per QPU and launch. Other kernels run one work-item per QPU, the number of
+    // QPUs is the number of work-items in a work-group.
+    const bool groupPerQPU = mergeFactor > 1 && !hasIndependentWorkItems && !kernel->loopsOverWorkItems();
     if(groupPerQPU && localSize > mergeFactor)
         return CL_INVALID_WORK_GROUP_SIZE;
     // the chunks of a work-group: a SIMT chunk is up to 16 consecutive work-items in x of a row (same y and z)
@@ -306,14 +307,16 @@ cl_int executeKernel(KernelExecution& args)
         (args.localSizes[0] + mergeFactor - 1) / mergeFactor, args.localSizes[1], args.localSizes[2]};
     const std::size_t chunksPerGroup =
         hasIndependentWorkItems ? chunkLimits[0] * chunkLimits[1] * chunkLimits[2] : 1;
+    // Kernels with barriers whose QPUs loop over the work-items of their work-group (in SIMT mode: over its chunks):
+    // QPU i runs the work-items (chunks) i, i + number of QPUs, ... The run-time passes QPU i the local IDs of the
+    // (first work-item of the) i-th work-item (chunk).
+    const std::size_t chunksPerLoopGroup = chunkLimits[0] * chunkLimits[1] * chunkLimits[2];
     const std::size_t numChunks = numGroups * chunksPerGroup;
-    // Kernels with barriers whose QPUs loop over the work-items of their work-group: QPU i runs the work-items i, i +
-    // number of QPUs, ...
     size_t numQPUs = hasIndependentWorkItems ?
         std::min<size_t>(args.system->getNumQPUs(), numChunks) :
         (groupPerQPU ? std::min<size_t>(args.system->getNumQPUs(), numGroups) :
                        (kernel->loopsOverWorkItems() ?
-                               std::min<size_t>(args.system->getNumQPUs(), localSize) :
+                               std::min<size_t>(args.system->getNumQPUs(), chunksPerLoopGroup) :
                                (localSize / mergeFactor) + (localSize % mergeFactor != 0)));
     if(numQPUs > args.system->getNumQPUs())
         return CL_INVALID_GLOBAL_WORK_SIZE;
@@ -351,13 +354,20 @@ cl_int executeKernel(KernelExecution& args)
                   << ")" << std::endl;
     })
 
+    // Kernels looping over their work-items have a stack frame per work-item (in SIMT mode: per chunk) of the
+    // work-group, all others one per QPU
+    const std::size_t numStackFrames = kernel->loopsOverWorkItems() ?
+        std::max<std::size_t>(args.system->getNumQPUs(), chunksPerLoopGroup) :
+        args.system->getNumQPUs();
+
     //
     // ALLOCATE BUFFER
     //
     size_t buffer_size = get_size(args.system->getNumQPUs(), kernel->info.getLength() * sizeof(uint64_t),
         hasIndependentWorkItems ? chunksPerLaunch * uniformsPerChunk :
                           numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
-        kernel->program->globalData.size() * sizeof(uint64_t), kernel->program->moduleInfo.getStackFrameSize());
+        kernel->program->globalData.size() * sizeof(uint64_t), numStackFrames,
+        kernel->program->moduleInfo.getStackFrameSize());
 
     std::unique_ptr<DeviceBuffer> buffer(
         args.system->allocateBuffer(static_cast<unsigned>(buffer_size), "VC4CL kernel"));
@@ -397,14 +407,13 @@ cl_int executeKernel(KernelExecution& args)
     }
 
     // Reserve space for stack-frames and fill it with zeros (e.g. for cl_khr_initialize_memory extension)
-    uint32_t maxQPUS = args.system->getNumQPUs();
     uint32_t stackFrameSize = static_cast<uint32_t>(kernel->program->moduleInfo.getStackFrameSize() * sizeof(uint64_t));
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
-        std::cout << "Reserving space for " << maxQPUS << " stack-frames of " << stackFrameSize << " bytes each"
-                  << std::endl)
+        std::cout << "Reserving space for " << numStackFrames << " stack-frames of " << stackFrameSize
+                  << " bytes each" << std::endl)
     if(kernel->program->context()->initializeMemoryToZero(CL_CONTEXT_MEMORY_INITIALIZE_PRIVATE_KHR))
-        memset(p, '\0', maxQPUS * stackFrameSize);
-    p += (maxQPUS * stackFrameSize) / sizeof(unsigned);
+        memset(p, '\0', numStackFrames * stackFrameSize);
+    p += (numStackFrames * stackFrameSize) / sizeof(unsigned);
 
     // Copy QPU program into GPU memory
     const unsigned* qpu_code = p;
@@ -598,7 +607,7 @@ cl_int executeKernel(KernelExecution& args)
         if(groupPerQPU)
             increment_index(qpu_group_indices, group_limits, 1);
         else
-            increment_index(local_indices, args.localSizes, 1);
+            increment_index(local_indices, chunkLimits, 1);
     }
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
@@ -705,7 +714,7 @@ cl_int executeKernel(KernelExecution& args)
             if(groupPerQPU)
                 increment_index(qpu_group_indices, group_limits, 1);
             else
-                increment_index(local_indices, args.localSizes, 1);
+                increment_index(local_indices, chunkLimits, 1);
         }
         // wait for and check previous work-group (possible asynchronous) execution
         if(!result.waitFor())
