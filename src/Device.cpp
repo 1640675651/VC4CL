@@ -21,6 +21,16 @@ using namespace vc4cl;
 
 Device::~Device() noexcept = default;
 
+/*
+ * The GPU memory (the contiguous memory area, CMA, with the DRM backend) is shared with the display and the rest of
+ * the system (e.g. the vc4 driver's binner memory and the desktop's buffers), so only about half of it is available
+ * for OpenCL buffers.
+ */
+static cl_ulong getGlobalMemorySize()
+{
+    return system()->getTotalGPUMemory() / 2;
+}
+
 cl_int Device::getInfo(
     cl_device_info param_name, size_t param_value_size, void* param_value, size_t* param_value_size_ret) const
 {
@@ -116,9 +126,12 @@ cl_int Device::getInfo(
     case CL_DEVICE_MAX_MEM_ALLOC_SIZE:
         //"Max size of memory object allocation in bytes.  The minimum value is max (1/4th of CL_DEVICE_GLOBAL_MEM_SIZE,
         // 1 MB)"
-        // VCSM (CMA) does not allow allocations of the full (CMA) range, so only return half of it
+        // All buffers are allocated as contiguous memory (CMA), which is shared with the display and fragmented, so
+        // large allocations often fail even with enough free memory. Report the minimum allowed (a quarter of the
+        // global memory size), so applications sizing their buffers by this limit (e.g. OpenCL-CTS) get buffers which
+        // can be allocated.
         return returnValue<cl_ulong>(
-            system()->getTotalGPUMemory() / 2, param_value_size, param_value, param_value_size_ret);
+            getGlobalMemorySize() / 4, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_IMAGE_SUPPORT:
         //"Is CL_TRUE if images are supported by the OpenCL device and CL_FALSE otherwise."
 #ifdef IMAGE_SUPPORT
@@ -236,12 +249,12 @@ cl_int Device::getInfo(
         return returnValue<cl_ulong>(device_config::CACHE_SIZE, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_GLOBAL_MEM_SIZE:
         //"Size of global device memory in bytes."
-        return returnValue<cl_ulong>(
-            system()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+        return returnValue<cl_ulong>(getGlobalMemorySize(), param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_MAX_CONSTANT_BUFFER_SIZE:
         //"Max size in bytes of a constant buffer allocation.  The minimum value is 64 KB (1KB for EMBEDDED PROFILE)"
+        // a constant buffer is a buffer like any other, see CL_DEVICE_MAX_MEM_ALLOC_SIZE
         return returnValue<cl_ulong>(
-            system()->getTotalGPUMemory(), param_value_size, param_value, param_value_size_ret);
+            getGlobalMemorySize() / 4, param_value_size, param_value, param_value_size_ret);
     case CL_DEVICE_MAX_CONSTANT_ARGS:
         //"Max number of arguments declared with the __constant qualifier in a kernel.  The minimum value is 8 (4 for
         // EMBEDDED PROFILE)"
