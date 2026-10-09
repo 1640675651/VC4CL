@@ -51,6 +51,11 @@ On 2026-10-06 classic mode changed to the same work-group limits as SIMT mode (1
 from before; with the larger limits, classic mode now also runs the largest `thread_dimensions`
 configurations (see below), so its `thread_dimensions` timeouts are expected to match SIMT mode's.
 
+On 2026-10-09 `api` and `basic` were rerun in both modes after the work-item loops were completed
+(kernels with barriers or `__local` memory accept 192 work-items in both modes, SIMT kernels with
+barriers run several work-groups at the same time; VC4C's `doc/SIMT.md`, roadmap item 3), with the
+same results as above (`cts-results/stage5`).
+
 ## Results per suite
 
 | Suite | SIMT pass | SIMT other | Classic pass | Classic other | Skipped |
