@@ -213,6 +213,20 @@ namespace vc4cl
         static constexpr const char* PRINTF_BUFFER_PARAMETER_NAME = "__vc4cl_printf_buffer";
         static constexpr unsigned PRINTF_BUFFER_SIZE = 16 * 1024;
         static constexpr unsigned PRINTF_MAX_RECORD_SIZE = 1024;
+        /*
+         * The hidden parameters of kernels whose work-groups run on teams of QPUs at the same time (SIMT kernels with
+         * barriers or __local memory): the QPU's team and the team's copy of the kernel's __local variables, each
+         * variable aligned to LOCAL_VARIABLE_ALIGNMENT bytes. All hidden parameters start with the prefix and follow
+         * the user's parameters.
+         *
+         * NOTE: These need to match the constants of VC4C (normalization/WorkItemLoops.h)!
+         */
+        static constexpr const char* HIDDEN_PARAMETER_PREFIX = "__vc4cl_";
+        static constexpr const char* WORK_GROUP_TEAM_PARAMETER_NAME = "__vc4cl_work_group_team";
+        static constexpr const char* LOCAL_VARIABLES_PARAMETER_NAME = "__vc4cl_local_variables";
+        static constexpr unsigned LOCAL_VARIABLE_ALIGNMENT = 16;
+        // two semaphores per team for its barriers
+        static constexpr unsigned MAX_WORK_GROUP_TEAMS = 6;
     } // namespace kernel_config
 
 } // namespace vc4cl

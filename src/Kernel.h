@@ -51,6 +51,13 @@ namespace vc4cl
          * parameter
          */
         bool hasPrintfBuffer() const;
+        // The index of the hidden parameter with the given name, or -1
+        int findHiddenParameter(const char* name) const;
+        // Whether the kernel's work-groups run on teams of QPUs at the same time
+        bool runsTeams() const;
+        // The number of teams (QPUs of a work-group: min(chunks, QPUs)) running work-groups at the same time, 1 if the
+        // kernel doesn't run teams
+        unsigned getNumTeams(const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& localSizes) const;
         /*
          * The number of parameters set by the user, excluding the hidden printf buffer
          */
@@ -68,10 +75,13 @@ namespace vc4cl
         std::bitset<kernel_config::MAX_PARAMETER_COUNT> argsSetMask;
 
     private:
-        CHECK_RETURN cl_int allocateAndTrackBufferArguments(
+        CHECK_RETURN cl_int allocateAndTrackBufferArguments(unsigned numTeams,
             std::map<unsigned, std::unique_ptr<DeviceBuffer>>& tmpBuffers,
             std::map<unsigned, std::pair<std::shared_ptr<DeviceBuffer>, DevicePointer>>& persistentBuffers) const;
     };
+
+    // The distance between the copies of a __local buffer of the size for the teams of QPUs, see Kernel::getNumTeams
+    unsigned getTeamStride(unsigned size);
 
     struct KernelArgument
     {

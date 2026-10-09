@@ -98,13 +98,33 @@ std::unique_ptr<KernelArgument> BufferArgument::clone() const
 Kernel::Kernel(Program* program, const KernelHeader& info) : program(program), info(info), argsSetMask(0)
 {
     args.resize(info.parameters.size());
-    if(hasPrintfBuffer())
+    auto printfIndex = findHiddenParameter(kernel_config::PRINTF_BUFFER_PARAMETER_NAME);
+    if(printfIndex >= 0)
     {
         // the printf buffer is allocated for every execution with the counter of written bytes reset to zero
         const uint32_t usedBytes = 0;
-        args.back().reset(new TemporaryBufferArgument(
+        args[static_cast<unsigned>(printfIndex)].reset(new TemporaryBufferArgument(
             4 + kernel_config::PRINTF_BUFFER_SIZE + kernel_config::PRINTF_MAX_RECORD_SIZE, &usedBytes, sizeof(usedBytes)));
-        argsSetMask.set(info.parameters.size() - 1, true);
+        argsSetMask.set(static_cast<unsigned>(printfIndex), true);
+    }
+    auto teamIndex = findHiddenParameter(kernel_config::WORK_GROUP_TEAM_PARAMETER_NAME);
+    if(teamIndex >= 0)
+    {
+        // the value is set per team by the executor
+        auto arg = new ScalarArgument(1);
+        arg->addScalar(0u);
+        args[static_cast<unsigned>(teamIndex)].reset(arg);
+        argsSetMask.set(static_cast<unsigned>(teamIndex), true);
+    }
+    auto localIndex = findHiddenParameter(kernel_config::LOCAL_VARIABLES_PARAMETER_NAME);
+    if(localIndex >= 0)
+    {
+        // a copy of the kernel's __local variables for every team, allocated for every execution
+        uint32_t size = kernel_config::LOCAL_VARIABLE_ALIGNMENT;
+        if(auto entry = findMetaData<MetaData::KERNEL_LOCAL_MEMORY_SIZE>(info.metaData))
+            size = std::max(size, entry->getValue<MetaData::KERNEL_LOCAL_MEMORY_SIZE>());
+        args[static_cast<unsigned>(localIndex)].reset(new TemporaryBufferArgument(size));
+        argsSetMask.set(static_cast<unsigned>(localIndex), true);
     }
 }
 
@@ -115,12 +135,51 @@ bool Kernel::loopsOverWorkItems() const
 
 bool Kernel::hasPrintfBuffer() const
 {
-    return !info.parameters.empty() && info.parameters.back().name == kernel_config::PRINTF_BUFFER_PARAMETER_NAME;
+    return findHiddenParameter(kernel_config::PRINTF_BUFFER_PARAMETER_NAME) >= 0;
+}
+
+int Kernel::findHiddenParameter(const char* name) const
+{
+    for(std::size_t i = 0; i < info.parameters.size(); ++i)
+    {
+        if(info.parameters[i].name == name)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+bool Kernel::runsTeams() const
+{
+    return findHiddenParameter(kernel_config::WORK_GROUP_TEAM_PARAMETER_NAME) >= 0;
+}
+
+unsigned Kernel::getNumTeams(const std::array<std::size_t, kernel_config::NUM_DIMENSIONS>& localSizes) const
+{
+    if(!runsTeams())
+        return 1;
+    auto mergeFactor = std::max(info.workItemMergeFactor, uint8_t{1});
+    auto chunks = ((localSizes[0] + mergeFactor - 1) / mergeFactor) * localSizes[1] * localSizes[2];
+    auto numQPUs = system()->getNumQPUs();
+    auto teamSize = std::max<std::size_t>(1, std::min<std::size_t>(chunks, numQPUs));
+    // a team of a single QPU needs no barrier semaphores
+    return teamSize == 1 ? numQPUs :
+                           std::min(static_cast<unsigned>(numQPUs / teamSize), kernel_config::MAX_WORK_GROUP_TEAMS);
+}
+
+unsigned vc4cl::getTeamStride(unsigned size)
+{
+    return (size + kernel_config::LOCAL_VARIABLE_ALIGNMENT - 1) / kernel_config::LOCAL_VARIABLE_ALIGNMENT *
+        kernel_config::LOCAL_VARIABLE_ALIGNMENT;
 }
 
 cl_uint Kernel::getNumUserArguments() const
 {
-    return static_cast<cl_uint>(info.parameters.size() - (hasPrintfBuffer() ? 1 : 0));
+    // the hidden parameters follow the user's parameters
+    cl_uint count = 0;
+    while(count < info.parameters.size() &&
+        info.parameters[count].name.find(kernel_config::HIDDEN_PARAMETER_PREFIX) != 0)
+        ++count;
+    return count;
 }
 
 Kernel::Kernel(const Kernel& other) : Object(), program(other.program), info(other.info), argsSetMask(other.argsSetMask)
@@ -720,7 +779,7 @@ cl_int Kernel::enqueueNDRange(CommandQueue* commandQueue, cl_uint work_dim, cons
 
     std::map<unsigned, std::unique_ptr<DeviceBuffer>> tmpBuffers;
     std::map<unsigned, std::pair<std::shared_ptr<DeviceBuffer>, DevicePointer>> persistentBuffers;
-    state = allocateAndTrackBufferArguments(tmpBuffers, persistentBuffers);
+    state = allocateAndTrackBufferArguments(getNumTeams(local_sizes), tmpBuffers, persistentBuffers);
     if(state != CL_SUCCESS)
         return returnError(state, __FILE__, __LINE__, "Error while allocating and tracking buffer kernel arguments");
 
@@ -750,7 +809,7 @@ cl_int Kernel::enqueueNDRange(CommandQueue* commandQueue, cl_uint work_dim, cons
     return kernelEvent->setAsResultOrRelease(ret_val, event);
 }
 
-CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(
+CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(unsigned numTeams,
     std::map<unsigned, std::unique_ptr<DeviceBuffer>>& tmpBuffers,
     std::map<unsigned, std::pair<std::shared_ptr<DeviceBuffer>, DevicePointer>>& persistentBuffers) const
 {
@@ -778,19 +837,23 @@ CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(
             }
             else
             {
+                // teams of QPUs running work-groups at the same time each have their own copy of the __local memory
+                unsigned sizeToAllocate = localArg->sizeToAllocate;
+                if(numTeams > 1 && info.parameters.at(i).getAddressSpace() == AddressSpace::LOCAL)
+                    sizeToAllocate = getTeamStride(localArg->sizeToAllocate) * numTeams;
                 auto bufIt = tmpBuffers.end();
                 bool initializeMemory = !localArg->data.empty();
                 bool zeroMemory = program->context()->initializeMemoryToZero(CL_CONTEXT_MEMORY_INITIALIZE_LOCAL_KHR);
                 if(initializeMemory || zeroMemory)
                     // we need to write from host-side
                     bufIt =
-                        tmpBuffers.emplace(i, system()->allocateBuffer(localArg->sizeToAllocate, "VC4CL temp buffer"))
+                        tmpBuffers.emplace(i, system()->allocateBuffer(sizeToAllocate, "VC4CL temp buffer"))
                             .first;
                 else
                     // no need to write from host-side
                     bufIt =
                         tmpBuffers
-                            .emplace(i, system()->allocateGPUOnlyBuffer(localArg->sizeToAllocate, "VC4CL temp buffer"))
+                            .emplace(i, system()->allocateGPUOnlyBuffer(sizeToAllocate, "VC4CL temp buffer"))
                             .first;
                 if(bufIt == tmpBuffers.end() || !bufIt->second)
                     // failed to allocate the temporary buffer
@@ -804,10 +867,10 @@ CHECK_RETURN cl_int Kernel::allocateAndTrackBufferArguments(
                 else if(zeroMemory)
                 {
                     // we need to initialize the local memory to zero
-                    memset(bufIt->second->hostPointer, '\0', localArg->sizeToAllocate);
+                    memset(bufIt->second->hostPointer, '\0', sizeToAllocate);
                 }
                 DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
-                    std::cout << "Reserved " << localArg->sizeToAllocate
+                    std::cout << "Reserved " << sizeToAllocate
                               << " bytes of buffer for local/struct parameter: " << info.parameters.at(i).typeName
                               << " " << info.parameters.at(i).name << std::endl)
             }

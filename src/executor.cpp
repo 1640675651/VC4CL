@@ -224,7 +224,8 @@ static void printPrintfOutput(const KernelExecution& args)
 {
     if(!args.kernel->hasPrintfBuffer())
         return;
-    auto bufferIt = args.tmpBuffers.find(static_cast<unsigned>(args.kernel->info.parameters.size() - 1));
+    auto bufferIt = args.tmpBuffers.find(
+        static_cast<unsigned>(args.kernel->findHiddenParameter(kernel_config::PRINTF_BUFFER_PARAMETER_NAME)));
     if(bufferIt == args.tmpBuffers.end() || !bufferIt->second)
         return;
     auto output = formatPrintfBuffer(bufferIt->second->hostPointer, args.kernel->program->globalData);
@@ -295,7 +296,11 @@ cl_int executeKernel(KernelExecution& args)
     // on any QPU: every QPU gets one block of UNIFORMs per chunk it runs, each followed by a flag whether another
     // block follows. So a single launch runs many chunks, of any work-groups, and work-groups of up to 192
     // work-items.
-    const bool hasIndependentWorkItems = kernel->info.uniformsUsed.getNextGroupFlagUsed();
+    // SIMT kernels with barriers or __local memory run their work-groups on teams of QPUs: several work-groups at the
+    // same time, each team looping over its work-groups (with the same UNIFORM blocks and flags as below).
+    const bool runsTeams = kernel->loopsOverWorkItems() && kernel->runsTeams() &&
+        kernel->info.uniformsUsed.getNextGroupFlagUsed();
+    const bool hasIndependentWorkItems = kernel->info.uniformsUsed.getNextGroupFlagUsed() && !runsTeams;
     // SIMT kernels without that loop (and not looping over the chunks of their work-group, see below) run a single
     // work-group (of at most 16 work-items) per QPU and launch. Other kernels run one work-item per QPU, the number of
     // QPUs is the number of work-items in a work-group.
@@ -312,7 +317,11 @@ cl_int executeKernel(KernelExecution& args)
     // (first work-item of the) i-th work-item (chunk).
     const std::size_t chunksPerLoopGroup = chunkLimits[0] * chunkLimits[1] * chunkLimits[2];
     const std::size_t numChunks = numGroups * chunksPerGroup;
-    size_t numQPUs = hasIndependentWorkItems ?
+    // the QPUs of a team running a work-group, the teams running at the same time
+    const std::size_t teamSize = std::min<std::size_t>(args.system->getNumQPUs(), chunksPerLoopGroup);
+    const std::size_t numTeams =
+        runsTeams ? std::max<std::size_t>(1, std::min<std::size_t>(kernel->getNumTeams(args.localSizes), numGroups)) : 1;
+    size_t numQPUs = runsTeams ? teamSize * numTeams : hasIndependentWorkItems ?
         std::min<size_t>(args.system->getNumQPUs(), numChunks) :
         (groupPerQPU ? std::min<size_t>(args.system->getNumQPUs(), numGroups) :
                        (kernel->loopsOverWorkItems() ?
@@ -335,6 +344,10 @@ cl_int executeKernel(KernelExecution& args)
     const std::size_t chunksPerLaunch = hasIndependentWorkItems ?
         std::min(numChunks, std::max(numQPUs, MAX_SIMT_UNIFORM_WORDS / uniformsPerChunk)) :
         1;
+    // the work-groups run by a single launch of teams (each team running several work-groups after another)
+    const std::size_t teamGroupsPerLaunch = runsTeams ?
+        std::min(numGroups, std::max(numTeams, MAX_SIMT_UNIFORM_WORDS / (uniformsPerChunk * teamSize))) :
+        0;
 
     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION, {
         std::cout << "Running kernel '" << kernel->info.name << "' with " << kernel->info.getLength()
@@ -357,15 +370,16 @@ cl_int executeKernel(KernelExecution& args)
     // Kernels looping over their work-items have a stack frame per work-item (in SIMT mode: per chunk) of the
     // work-group, all others one per QPU
     const std::size_t numStackFrames = kernel->loopsOverWorkItems() ?
-        std::max<std::size_t>(args.system->getNumQPUs(), chunksPerLoopGroup) :
+        std::max<std::size_t>(args.system->getNumQPUs(), chunksPerLoopGroup * kernel->getNumTeams(args.localSizes)) :
         args.system->getNumQPUs();
 
     //
     // ALLOCATE BUFFER
     //
     size_t buffer_size = get_size(args.system->getNumQPUs(), kernel->info.getLength() * sizeof(uint64_t),
-        hasIndependentWorkItems ? chunksPerLaunch * uniformsPerChunk :
-                          numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount()),
+        runsTeams ? teamGroupsPerLaunch * teamSize * uniformsPerChunk :
+                    (hasIndependentWorkItems ? chunksPerLaunch * uniformsPerChunk :
+                                               numQPUs * (MAX_HIDDEN_PARAMETERS + kernel->info.getExplicitUniformCount())),
         kernel->program->globalData.size() * sizeof(uint64_t), numStackFrames,
         kernel->program->moduleInfo.getStackFrameSize());
 
@@ -425,9 +439,16 @@ cl_int executeKernel(KernelExecution& args)
                   << " bytes of kernel code to device buffer" << std::endl)
 
     // Writes the UNIFORMs for the kernel parameters, returns false for unhandled argument types
-    auto writeParameters = [&](unsigned*& p) -> bool {
+    // the team (see runsTeams): every team has its own copy of the __local buffers and its own index
+    const int teamParameter = kernel->findHiddenParameter(kernel_config::WORK_GROUP_TEAM_PARAMETER_NAME);
+    auto writeParameters = [&](unsigned*& p, unsigned team = 0) -> bool {
         for(unsigned u = 0; u < kernel->info.parameters.size(); ++u)
         {
+            if(static_cast<int>(u) == teamParameter)
+            {
+                *p++ = team;
+                continue;
+            }
             auto tmpBufferIt = args.tmpBuffers.find(u);
             auto persistentBufferIt = args.persistentBuffers.find(u);
             if(tmpBufferIt != args.tmpBuffers.end())
@@ -444,7 +465,11 @@ cl_int executeKernel(KernelExecution& args)
                 {
                     // there exists a temporary buffer for the __local/struct parameter, so set its address as
                     // kernel argument
-                    *p++ = static_cast<unsigned>(tmpBufferIt->second->qpuPointer);
+                    unsigned teamOffset = 0;
+                    auto localArg = dynamic_cast<const TemporaryBufferArgument*>(args.executionArguments.at(u).get());
+                    if(team > 0 && localArg && kernel->info.parameters[u].getAddressSpace() == AddressSpace::LOCAL)
+                        teamOffset = team * getTeamStride(localArg->sizeToAllocate);
+                    *p++ = static_cast<unsigned>(tmpBufferIt->second->qpuPointer) + teamOffset;
                     DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
                         std::cout << "Setting parameter " << (kernel->info.uniformsUsed.countUniforms() + u)
                                   << " to temporary buffer " << tmpBufferIt->second->qpuPointer << std::endl)
@@ -481,6 +506,93 @@ cl_int executeKernel(KernelExecution& args)
         }
         return true;
     };
+
+    if(runsTeams)
+    {
+        // Two blocks of UNIFORMs and launch messages: one is prepared while the other one is executed
+        const std::size_t blockWords = teamGroupsPerLaunch * teamSize * uniformsPerChunk;
+        std::array<unsigned*, 2> uniformBlocks{p, p + blockWords};
+        p += 2 * blockWords;
+        std::array<unsigned*, 2> launchMessages{p, p + 2 * numQPUs};
+        p += 4 * numQPUs;
+
+        // Writes the UNIFORMs and launch messages for the given work-groups: team t runs the work-groups t, t + n,
+        // t + 2n, ... (with n teams launched), QPU i of a team starts with the local IDs of chunk i of the work-group.
+        auto prepareLaunch = [&](unsigned block, std::size_t firstGroup, std::size_t launchGroups,
+                                 std::size_t& launchQPUs) -> bool {
+            auto teams = std::min(numTeams, launchGroups);
+            launchQPUs = teams * teamSize;
+            unsigned* u = uniformBlocks[block];
+            unsigned* msg = launchMessages[block];
+            for(std::size_t t = 0; t < teams; ++t)
+            {
+                for(std::size_t i = 0; i < teamSize; ++i)
+                {
+                    *msg++ = AS_GPU_ADDRESS(u, buffer.get());
+                    *msg++ = AS_GPU_ADDRESS(qpu_code, buffer.get());
+                    std::array<std::size_t, kernel_config::NUM_DIMENSIONS> chunkIndices = {i % chunkLimits[0],
+                        (i / chunkLimits[0]) % chunkLimits[1], i / (chunkLimits[0] * chunkLimits[1])};
+                    for(std::size_t g = t; g < launchGroups; g += teams)
+                    {
+                        auto group = firstGroup + g;
+                        std::array<std::size_t, kernel_config::NUM_DIMENSIONS> groupIndices = {
+                            group % group_limits[0], (group / group_limits[0]) % group_limits[1],
+                            group / (group_limits[0] * group_limits[1])};
+                        u = set_work_item_info(u, args.numDimensions, args.globalOffsets, args.globalSizes,
+                            args.localSizes, groupIndices, chunkIndices, global_data, AS_GPU_ADDRESS(u, buffer.get()),
+                            kernel->info.uniformsUsed, mergeFactor);
+                        if(!writeParameters(u, static_cast<unsigned>(t)))
+                            return false;
+                        *u++ = g + teams < launchGroups ? 1u : 0u;
+                    }
+                }
+            }
+            return true;
+        };
+
+        std::size_t launchGroups = teamGroupsPerLaunch;
+        std::size_t launchQPUs = 0;
+        unsigned block = 0;
+        if(!prepareLaunch(block, 0, launchGroups, launchQPUs))
+            return CL_INVALID_KERNEL_ARGS;
+        flushHostCache(*args.system, buffer, args.tmpBuffers, args.persistentBuffers);
+
+        auto timeout = KERNEL_TIMEOUT * std::max(std::size_t{30}, teamGroupsPerLaunch);
+        const auto accessedBuffers = collectBuffers(buffer, args.tmpBuffers, args.persistentBuffers);
+        std::unique_ptr<PerformanceCollector> perfCollector;
+        if(args.performanceCounters)
+            perfCollector.reset(
+                new PerformanceCollector(*args.performanceCounters, args.kernel->info, numQPUs, numGroups));
+        DEBUG_LOG(DebugLevel::KERNEL_EXECUTION,
+            std::cout << "Running work-groups 0 to " << (launchGroups - 1) << " on " << numTeams << " teams of "
+                      << teamSize << " QPUs" << std::endl)
+        auto result = args.system->executeQPU(static_cast<unsigned>(launchQPUs),
+            std::make_pair(launchMessages[block], AS_GPU_ADDRESS(launchMessages[block], buffer.get())),
+            accessedBuffers, true, timeout);
+        for(std::size_t nextGroup = launchGroups; nextGroup < numGroups; nextGroup += launchGroups)
+        {
+            block ^= 1u;
+            launchGroups = std::min(teamGroupsPerLaunch, numGroups - nextGroup);
+            // the arguments were already written successfully for the first launch
+            prepareLaunch(block, nextGroup, launchGroups, launchQPUs);
+            // wait for and check previous (possible asynchronous) execution
+            if(!result.waitFor())
+                return CL_OUT_OF_RESOURCES;
+            flushHostCache(*args.system, buffer, {}, {});
+            result = args.system->executeQPU(static_cast<unsigned>(launchQPUs),
+                std::make_pair(launchMessages[block], AS_GPU_ADDRESS(launchMessages[block], buffer.get())),
+                accessedBuffers, false, timeout);
+        }
+        auto status = result.waitFor();
+        perfCollector.reset();
+        if(status)
+            printPrintfOutput(args);
+
+        args.tmpBuffers.clear();
+        args.persistentBuffers.clear();
+        args.executionArguments.clear();
+        return status ? CL_COMPLETE : CL_OUT_OF_RESOURCES;
+    }
 
     if(hasIndependentWorkItems)
     {
