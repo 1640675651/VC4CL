@@ -42,6 +42,18 @@ static uint32_t alignToPage(uint32_t size)
     return (size + PAGE_ALIGNMENT - 1) / PAGE_ALIGNMENT * PAGE_ALIGNMENT;
 }
 
+/*
+ * In SIMT kernels, the lanes beyond the end of a work-group still load (and discard) up to 15 32-bit words past the last
+ * element the work-group accesses. Reserving these bytes after every buffer keeps such loads inside the buffer object,
+ * also for a buffer at the end of the GPU memory.
+ */
+static constexpr uint32_t BUFFER_PADDING = 64;
+
+static uint32_t allocationSize(uint32_t size)
+{
+    return alignToPage(size + BUFFER_PADDING);
+}
+
 static void closeBufferObject(int fd, uint32_t handle)
 {
     drm_gem_close close{};
@@ -130,7 +142,7 @@ std::unique_ptr<DeviceBuffer> DRM::allocateBuffer(
     const std::shared_ptr<SystemAccess>& system, unsigned sizeInBytes, const std::string& name)
 {
     drm_vc4_create_bo create{};
-    create.size = alignToPage(sizeInBytes);
+    create.size = allocationSize(sizeInBytes);
     if(drmIoctl(fd, DRM_IOCTL_VC4_CREATE_BO, &create) != 0)
     {
         DEBUG_LOG(DebugLevel::MEMORY,
@@ -178,7 +190,7 @@ bool DRM::deallocateBuffer(const DeviceBuffer* buffer)
 {
     // The driver keeps the memory alive until all compute jobs using it finished
     if(buffer->hostPointer)
-        munmap(buffer->hostPointer, alignToPage(buffer->size));
+        munmap(buffer->hostPointer, allocationSize(buffer->size));
     closeBufferObject(fd, buffer->memHandle);
     DEBUG_LOG(DebugLevel::MEMORY,
         std::cout << "Deallocated " << buffer->size << " bytes of buffer: handle " << buffer->memHandle
